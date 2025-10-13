@@ -88,7 +88,7 @@ client.on("interactionCreate", async (interaction: Interaction) => {
   }
 });
 
-// Load commands first, then login (ESM-friendly, no top-level await required)
+// Load commands first, then login
 loadCommands()
   .then(() => client.login(token))
   .catch(err => { console.error("Boot error:", err); process.exit(1); });
