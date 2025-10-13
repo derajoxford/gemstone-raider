@@ -1,8 +1,8 @@
-import { SlashCommandBuilder, type ChatInputCommandInteraction } from "discord.js";
+import { SlashCommandBuilder, MessageFlags, type ChatInputCommandInteraction } from "discord.js";
 import type { Command } from "../types/command.js";
 import { query } from "../data/db.js";
 import { getGuildSettings } from "../data/settings.js";
-import { fetchNationMap, type NationDetail } from "../pnw/nations.js";
+import { fetchNationMap } from "../pnw/nations.js";
 import { dossierEmbed } from "../ui/dossier.js";
 
 const DECL_MIN = 0.75;
@@ -24,29 +24,29 @@ const execute = async (interaction: ChatInputCommandInteraction) => {
   const nationIdStr = interaction.options.getString("nation_id", true).trim();
   const targetId = Number(nationIdStr);
   if (!Number.isFinite(targetId) || targetId <= 0) {
-    await interaction.reply({ content: "Invalid nation ID.", ephemeral: true });
+    await interaction.reply({ content: "Invalid nation ID.", flags: MessageFlags.Ephemeral });
     return;
   }
 
-  // Attacker = user’s primary linked nation
+  // User's primary linked nation = attacker
   const me = interaction.user.id;
   const myRow = await query<{ nation_id: number }>(
     "SELECT nation_id FROM user_nation WHERE discord_user_id=$1 AND is_primary=true LIMIT 1",
     [me]
   );
   if (!myRow.rowCount) {
-    await interaction.reply({ content: "Link your nation first with `/link_nation`.", ephemeral: true });
+    await interaction.reply({ content: "Link your nation first with `/link_nation`.", flags: MessageFlags.Ephemeral });
     return;
   }
   const attackerId = Number(myRow.rows[0].nation_id);
 
-  // Fetch both
+  // Fetch both nations
   const map = await fetchNationMap([targetId, attackerId]);
   const target = map[targetId];
   const attacker = map[attackerId];
 
   if (!target) {
-    await interaction.reply({ content: "Couldn’t load that nation — check the ID.", ephemeral: true });
+    await interaction.reply({ content: "Couldn’t load that nation — check the ID.", flags: MessageFlags.Ephemeral });
     return;
   }
 
@@ -66,8 +66,7 @@ const execute = async (interaction: ChatInputCommandInteraction) => {
     status: status as any
   });
 
-  // Dossier is noisy; keep it ephemeral
-  await interaction.reply({ ...(payload as any), ephemeral: true });
+  await interaction.reply({ ...(payload as any), flags: MessageFlags.Ephemeral });
 };
 
 function rangeStatus(attackerScore: number, targetScore: number, nearPct: number) {
