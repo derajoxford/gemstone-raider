@@ -1,14 +1,12 @@
-import type { Client, Guild, TextBasedChannel } from "discord.js";
+import type { Client, Guild } from "discord.js";
 import { query } from "../data/db.js";
 import { getGuildSettings } from "../data/settings.js";
-import { fetchAidSince, fetchPriceMap, type Resource } from "../pnw/client.js";
+import { fetchAidSince, fetchPriceMap } from "../pnw/client.js";
 import { fetchNationMap } from "../pnw/nations.js";
 import { depositAlertEmbed } from "../ui/embeds.js";
 
-// Poll every N ms (default 90s)
 const POLL_MS = Number(process.env.AID_POLL_MS ?? 90_000);
-
-// War-declare score window (as of Aug 2023: 75%..250%)
+// Score declare window (Aug 2023): 75%..250%
 const DECL_MIN = 0.75;
 const DECL_MAX = 2.50;
 
@@ -41,7 +39,7 @@ async function runOnce(client: Client) {
   const lastAidId = cur.rows[0]?.last_aid_id ?? undefined;
   const lastSeenIso = cur.rows[0]?.last_seen_at ?? undefined;
 
-  // new aid (receiver is the potential target)
+  // new aid (receiver is the target)
   const aid = await fetchAidSince(lastAidId, lastSeenIso);
   if (!aid.length) return;
 
@@ -52,16 +50,16 @@ async function runOnce(client: Client) {
   const channelId = gs.deposits_channel_id || process.env.DEPOSITS_CHANNEL_ID || null;
   if (!channelId) return;
   const ch = await client.channels.fetch(channelId).catch(() => null);
-  if (!ch || !("send" in ch)) return;
-  const channel = ch as TextBasedChannel;
+  if (!ch || typeof (ch as any).send !== "function") return; // safe narrow
+  const channel = ch as any;
 
-  // Linked raiders in this guild (primary nation only)
+  // Linked raiders (primary nation)
   const raiders = await query<{ discord_user_id: string; nation_id: number }>(
     "SELECT discord_user_id, nation_id FROM user_nation WHERE is_primary=true"
   );
   const raiderNationIds = raiders.rows.map(r => Number(r.nation_id)).filter(n => Number.isFinite(n));
 
-  // Process in chronological order
+  // chronological
   const ordered = [...aid].sort((a, b) => a.id - b.id);
 
   let newestId = lastAidId ?? 0;
@@ -74,20 +72,16 @@ async function runOnce(client: Client) {
 
     if (notional < abs) continue;
 
-    // de-dupe
+    // dedupe
     const hash = `${ev.id}-${ev.receiverId}-${Math.round(notional)}`;
     const { rows: existing } = await query("SELECT 1 FROM alert_log WHERE message_hash=$1", [hash]);
     if (existing.length) continue;
 
-    // fetch nation scores (target + raiders)
+    // nation scores (target + raiders)
     const nationMap = await fetchNationMap([ev.receiverId, ...raiderNationIds]);
     const target = nationMap[ev.receiverId];
-    if (!target || !Number.isFinite(target.score)) {
-      // log but still send channel post (best effort)
-      console.warn("No score for target", ev.receiverId);
-    }
 
-    // Decide who to DM (in-range or near-range)
+    // who to DM (in-range / near-range)
     let dmUsers: string[] = [];
     if (gs.alerts_dm && target) {
       for (const r of raiders.rows) {
@@ -98,7 +92,7 @@ async function runOnce(client: Client) {
       }
     }
 
-    // Post to channel
+    // channel post
     const payload = depositAlertEmbed({
       nationId: ev.receiverId,
       nationName: ev.receiverName,
@@ -117,7 +111,7 @@ async function runOnce(client: Client) {
       allowedMentions: { parse: [], roles: gs.alerts_role_id ? [gs.alerts_role_id] : [] }
     });
 
-    // DM in-range/near-range raiders
+    // DM raiders
     if (dmUsers.length) {
       await dmLinkedRaiders(guild, dmUsers, {
         ...(payload as any),
@@ -140,7 +134,6 @@ async function runOnce(client: Client) {
 
 // ---------- helpers ----------
 async function dmLinkedRaiders(guild: Guild, userIds: string[], message: any) {
-  // best-effort: DM users who are in the guild by ID
   for (const uid of userIds) {
     const m = await guild.members.fetch(uid).catch(() => null);
     const u = m?.user;
@@ -186,7 +179,6 @@ function timeAgo(iso: string) {
   const d = Math.floor(hr / 24); return `${d}d ago`;
 }
 
-// Compute in-range/near-range given attackerScore vs targetScore
 function rangeStatus(attackerScore: number, targetScore: number, nearPct: number) {
   const min = attackerScore * DECL_MIN;
   const max = attackerScore * DECL_MAX;
