@@ -76,9 +76,12 @@ async function runOnce(client: Client) {
     let anyInRange = true;
     if (gs.inrange_only && target && typeof target.score === "number") {
       const nearPct = gs.near_range_pct ?? 5;
+      const tScore: number = target.score; // hard narrow
       anyInRange = raiderIds.some(rid => {
-        const rn = nationMap[rid]; if (!rn || typeof rn.score !== "number") return false;
-        const s = rangeStatus(rn.score, target.score, nearPct);
+        const rn = nationMap[rid];
+        if (!rn || typeof rn.score !== "number") return false;
+        const aScore: number = rn.score; // hard narrow
+        const s = rangeStatus(aScore, tScore, nearPct);
         return s.inRange || s.nearRange;
       });
     }
@@ -111,6 +114,7 @@ async function runOnce(client: Client) {
     // DM watchers of this nation (per-user thresholds & inrange_only)
     const watchers = await watchersForNation(ev.receiverId);
     if (watchers.length && target && typeof target.score === "number") {
+      const targetScore: number = target.score; // hard narrow
       for (const w of watchers) {
         const member = await guild.members.fetch(w.discord_user_id).catch(() => null);
         const user = member?.user; if (!user) continue;
@@ -129,7 +133,8 @@ async function runOnce(client: Client) {
           const nid = myNation.rows[0]?.nation_id; if (!nid) continue;
           const attacker = nationMap[nid];
           if (!attacker || typeof attacker.score !== "number") continue;
-          const s = rangeStatus(attacker.score, target.score!, gs.near_range_pct ?? 5);
+          const aScore: number = attacker.score; // hard narrow
+          const s = rangeStatus(aScore, targetScore, gs.near_range_pct ?? 5);
           if (!s.inRange && !s.nearRange) continue;
         }
 
