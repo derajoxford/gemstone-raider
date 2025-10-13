@@ -6,7 +6,7 @@ import { fetchNationMap } from "../pnw/nations.js";
 import { depositAlertEmbed } from "../ui/embeds.js";
 
 const POLL_MS = Number(process.env.AID_POLL_MS ?? 90_000);
-// Score declare window (Aug 2023): 75%..250%
+// Declare window (Aug 2023): 75%..250%
 const DECL_MIN = 0.75;
 const DECL_MAX = 2.50;
 
@@ -39,7 +39,7 @@ async function runOnce(client: Client) {
   const lastAidId = cur.rows[0]?.last_aid_id ?? undefined;
   const lastSeenIso = cur.rows[0]?.last_seen_at ?? undefined;
 
-  // new aid (receiver is the target)
+  // new aid
   const aid = await fetchAidSince(lastAidId, lastSeenIso);
   if (!aid.length) return;
 
@@ -81,13 +81,15 @@ async function runOnce(client: Client) {
     const nationMap = await fetchNationMap([ev.receiverId, ...raiderNationIds]);
     const target = nationMap[ev.receiverId];
 
-    // who to DM (in-range / near-range)
+    // who to DM (in-range / near-range) — only if we have numeric scores
     let dmUsers: string[] = [];
-    if (gs.alerts_dm && target) {
+    if (gs.alerts_dm && target && typeof target.score === "number") {
+      const targetScore = target.score;
       for (const r of raiders.rows) {
         const rn = nationMap[r.nation_id];
-        if (!rn || !Number.isFinite(rn.score)) continue;
-        const status = rangeStatus(rn.score, target.score, gs.near_range_pct ?? 5);
+        if (!rn || typeof rn.score !== "number") continue;
+        const attackerScore = rn.score;
+        const status = rangeStatus(attackerScore, targetScore, gs.near_range_pct ?? 5);
         if (status.inRange || status.nearRange) dmUsers.push(r.discord_user_id);
       }
     }
