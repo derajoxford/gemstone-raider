@@ -28,9 +28,9 @@ if (!token || !appId) {
   throw new Error("Missing DISCORD_TOKEN or DISCORD_APP_ID");
 }
 
-// Client with minimal intents required for slash commands + members (for DMs)
+// Minimal intents: NO privileged intents required
 const client = new Client({
-  intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMembers],
+  intents: [GatewayIntentBits.Guilds],
 });
 
 // In-memory command registry (name -> handler)
@@ -143,7 +143,11 @@ client.on("interactionCreate", async (interaction: Interaction) => {
     console.error("interaction error:", e);
     // best-effort reply (avoid double-reply)
     try {
-      if (interaction.isRepliable() && !interaction.replied && !interaction.deferred) {
+      if (
+        interaction.isRepliable() &&
+        !interaction.replied &&
+        !interaction.deferred
+      ) {
         await interaction.reply({
           content: "⚠️ Error executing action.",
           flags: MessageFlags.Ephemeral,
