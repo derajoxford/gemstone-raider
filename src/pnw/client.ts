@@ -77,4 +77,34 @@ function toAidEvent(r: any): AidEvent {
   const t = r.receiver || r.recipient || {};
   return {
     id: Number(r.id ?? r.aidid ?? 0),
-    sent
+    sentAt: String(r.date ?? r.sent ?? r.time ?? new Date().toISOString()),
+    senderId: numOrNull(s.id ?? r.sender_id ?? r.donor_id),
+    senderName: strOrNull(s.name ?? r.sender_name ?? r.donor_name),
+    receiverId: Number(t.id ?? r.receiver_id ?? r.recipient_id ?? 0),
+    receiverName: String(t.name ?? r.receiver_name ?? r.recipient_name ?? "Unknown"),
+    cash: Number(r.cash ?? r.money ?? r.dollars ?? 0),
+    food: numOrUndef(r.food),
+    munitions: numOrUndef(r.munitions),
+    steel: numOrUndef(r.steel),
+    oil: numOrUndef(r.oil),
+    aluminum: numOrUndef(r.aluminum),
+    uranium: numOrUndef(r.uranium),
+    gasoline: numOrUndef(r.gasoline),
+    coal: numOrUndef(r.coal),
+    iron: numOrUndef(r.iron),
+    bauxite: numOrUndef(r.bauxite)
+  };
+}
+
+function numOrNull(v: any) { const n = Number(v); return Number.isFinite(n) ? n : null; }
+function strOrNull(v: any) { return (v === undefined || v === null) ? null : String(v); }
+function numOrUndef(v: any) { const n = Number(v); return Number.isFinite(n) ? n : undefined; }
+
+// ---- Price map (stub — replace with real market fetch later) ----
+export type Resource = "food"|"munitions"|"steel"|"oil"|"aluminum"|"uranium"|"gasoline"|"coal"|"iron"|"bauxite";
+export type PriceMap = Partial<Record<Resource, number>>;
+
+export async function fetchPriceMap(): Promise<PriceMap> {
+  // TODO: wire to market endpoint; return {} for now (cash-only notional)
+  return {};
+}
