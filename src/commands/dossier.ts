@@ -2,7 +2,7 @@ import { SlashCommandBuilder, type ChatInputCommandInteraction } from "discord.j
 import type { Command } from "../types/command.js";
 import { query } from "../data/db.js";
 import { getGuildSettings } from "../data/settings.js";
-import { fetchNationMap } from "../pnw/nations.js";
+import { fetchNationMap, type NationDetail } from "../pnw/nations.js";
 import { dossierEmbed } from "../ui/dossier.js";
 
 const DECL_MIN = 0.75;
@@ -28,7 +28,7 @@ const execute = async (interaction: ChatInputCommandInteraction) => {
     return;
   }
 
-  // Who's asking? Get their primary linked nation.
+  // Attacker = user’s primary linked nation
   const me = interaction.user.id;
   const myRow = await query<{ nation_id: number }>(
     "SELECT nation_id FROM user_nation WHERE discord_user_id=$1 AND is_primary=true LIMIT 1",
@@ -40,7 +40,7 @@ const execute = async (interaction: ChatInputCommandInteraction) => {
   }
   const attackerId = Number(myRow.rows[0].nation_id);
 
-  // Pull target + attacker scores
+  // Fetch both
   const map = await fetchNationMap([targetId, attackerId]);
   const target = map[targetId];
   const attacker = map[attackerId];
@@ -50,26 +50,23 @@ const execute = async (interaction: ChatInputCommandInteraction) => {
     return;
   }
 
-  const attScore = attacker?.score ?? null;
-  const tarScore = target?.score ?? null;
+  const window = attacker?.score != null
+    ? { min: attacker.score * DECL_MIN, max: attacker.score * DECL_MAX }
+    : { min: 0, max: 0 };
 
-  let status = { inRange: false, nearRange: false, deltaPct: undefined as number | undefined, side: undefined as "below" | "above" | undefined };
-  let window = { min: 0, max: 0 };
-
-  if (attScore != null && tarScore != null) {
-    window = { min: attScore * DECL_MIN, max: attScore * DECL_MAX };
-    status = rangeStatus(attScore, tarScore, nearPct);
-  }
+  const status = (attacker?.score != null && target?.score != null)
+    ? rangeStatus(attacker.score, target.score, nearPct)
+    : { inRange: false, nearRange: false };
 
   const payload = dossierEmbed({
-    target: { id: targetId, name: target?.name ?? "Unknown", score: tarScore },
-    attacker: { id: attackerId, name: attacker?.name, score: attScore },
+    target,
+    attacker,
     nearPct,
     window,
-    status
+    status: status as any
   });
 
-  // Dossier is noisy; return ephemeral so pros can pull it on demand
+  // Dossier is noisy; keep it ephemeral
   await interaction.reply({ ...(payload as any), ephemeral: true });
 };
 
@@ -78,7 +75,6 @@ function rangeStatus(attackerScore: number, targetScore: number, nearPct: number
   const max = attackerScore * DECL_MAX;
   const inRange = targetScore >= min && targetScore <= max;
 
-  // near-range windows
   const lowNearMin = min * (1 - (nearPct / 100));
   const highNearMax = max * (1 + (nearPct / 100));
 
