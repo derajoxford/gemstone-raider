@@ -3,21 +3,22 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
-  "engines": {
-    "node": ">=20"
-  },
+  "engines": { "node": ">=20" },
   "scripts": {
     "build": "tsc -b",
     "start": "node dist/index.js",
     "dev": "tsx src/index.ts",
-    "register": "tsx scripts/register-commands.mts"
+    "register": "tsx scripts/register-commands.mts",
+    "migrate": "tsx scripts/migrate.mts"
   },
   "dependencies": {
     "discord.js": "^14.16.3",
-    "dotenv": "^16.4.5"
+    "dotenv": "^16.4.5",
+    "pg": "^8.12.0"
   },
   "devDependencies": {
     "tsx": "^4.19.2",
-    "typescript": "^5.6.3"
+    "typescript": "^5.6.3",
+    "@types/pg": "^8.10.2"
   }
 }
