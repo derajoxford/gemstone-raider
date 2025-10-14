@@ -1,224 +1,307 @@
-// src/jobs/poll_aid.ts
-// Global Bank Radar — scans ALL aid (nation→nation + alliance→nation) and alerts on large deposits.
-// Safe with only GatewayIntentBits.Guilds; no member fetch.
-// Cadence taken from env with jitter + simple quiet backoff.
-// Posts to each guild’s configured alerts channel and DMs watchers of the receiver nation.
-
-import type { Client, TextBasedChannel } from "discord.js";
-import { EmbedBuilder } from "discord.js";
+import { TextChannel, ChannelType, Client, Guild } from "discord.js";
 import { query } from "../data/db.js";
 import { getGuildSettings } from "../data/settings.js";
 import { fetchAidSince, fetchPriceMap } from "../pnw/client.js";
+import { fetchNationMap } from "../pnw/nations.js";
+import { depositAlertEmbed } from "../ui/embeds.js";
+import { bankRowWithWatch } from "../ui/radar.js";
+import { watchersForNation } from "../data/watch.js";
 
-const ms = (n: number) => Math.max(0, Math.floor(n));
-const nowSec = () => Math.floor(Date.now() / 1000);
-const withJitter = (baseMs: number, jitterMs: number) =>
-  ms(baseMs + (Math.random() * 2 - 1) * jitterMs);
+/** Declare window used for in/near range checks */
+const DECL_MIN = 0.75;
+const DECL_MAX = 2.50;
 
-// env knobs (fallbacks match /etc/pnw-raider.env)
-const POLL_SEC = Number(process.env.DEPOSITS_POLL_SEC || "15");
-const POLL_MIN_SEC = Number(process.env.DEPOSITS_POLL_MIN_SEC || "10");
-const POLL_MAX_SEC = Number(process.env.DEPOSITS_POLL_MAX_SEC || "45");
-const POLL_JITTER_SEC = Number(process.env.DEPOSITS_POLL_JITTER_SEC || "3");
-const QUIET_BACKOFF_SEC = Number(process.env.DEPOSITS_BACKOFF_AFTER_QUIET_SEC || "120");
-const BURST_TIGHTEN_COUNT = Number(process.env.DEPOSITS_BURST_TIGHTEN_COUNT || "10");
-const BURST_WINDOW_SEC = Number(process.env.DEPOSITS_BURST_WINDOW_SEC || "60");
-
-// thresholds
-const ABS_USD_DEFAULT = Number(process.env.DEPOSIT_THRESHOLD_ABS_USD || "100000000");
-const REL_PCT_DEFAULT = Number(process.env.DEPOSIT_THRESHOLD_REL_PCT || "20");
-// Optional: if set, REL threshold is LOOT_P50_USD * relPct / 100
-const LOOT_P50_USD = Number(process.env.LOOT_P50_USD || "0");
-
-type AidRow = {
-  id: number;
-  sender_type: "NATION" | "ALLIANCE";
-  sender_id: number;
-  receiver_type: "NATION" | "ALLIANCE";
-  receiver_id: number;
-  cash: number;
-  resources?: Record<string, number> | null;
-  created_at: string; // ISO
-};
-
-async function valueUSD(resources: Record<string, number> | null | undefined, cash: number): Promise<number> {
-  let total = Number(cash || 0);
-  const price = await fetchPriceMap(); // { resource: priceUSD }
-  if (resources) {
-    for (const [k, v] of Object.entries(resources)) {
-      const qty = Number(v || 0);
-      const p = Number((price as any)[k] || 0);
-      if (!Number.isFinite(qty) || qty <= 0) continue;
-      total += qty * p;
-    }
-  }
-  return Math.max(0, Math.floor(total));
-}
-
-function passThreshold(amountUSD: number, absGuild?: number, relGuildPct?: number): boolean {
-  const abs = Number.isFinite(absGuild) && (absGuild as number) > 0 ? (absGuild as number) : ABS_USD_DEFAULT;
-  const relPct = Number.isFinite(relGuildPct) && (relGuildPct as number) > 0 ? (relGuildPct as number) : REL_PCT_DEFAULT;
-  if (amountUSD >= abs) return true;
-  if (LOOT_P50_USD > 0 && amountUSD >= (LOOT_P50_USD * relPct) / 100) return true;
-  return false;
-}
-
-function formatUSD(n: number) {
-  return `$${n.toLocaleString("en-US")}`;
-}
-
-function nationLink(id: number) {
-  return `https://politicsandwar.com/nation/id=${id}`;
-}
-function allianceLink(id: number) {
-  return `https://politicsandwar.com/alliance/id=${id}`;
-}
-
+/** Entry: starts the periodic poller */
 export function startAidPoller(client: Client) {
-  let lastSeenId = 0;
-  let lastHitTs = 0;
-  const hitTimestamps: number[] = [];
-
-  const baseMs = ms(POLL_SEC * 1000);
-  const minMs = ms(POLL_MIN_SEC * 1000);
-  const maxMs = ms(POLL_MAX_SEC * 1000);
-  const jitterMs = ms(POLL_JITTER_SEC * 1000);
-
-  let dynamicMs = baseMs;             // <-- only declared here
-  let timer: NodeJS.Timeout | null = null;
-
-  const scheduleNext = () => {
-    // quiet backoff (no hits for a while)
-    if (lastHitTs && nowSec() - lastHitTs >= QUIET_BACKOFF_SEC) {
-      dynamicMs = Math.min(maxMs, Math.max(dynamicMs, baseMs * 2));
-    }
-
-    // burst tighten (lots of hits recently)
-    const cutoff = nowSec() - BURST_WINDOW_SEC;
-    while (hitTimestamps.length && hitTimestamps[0] < cutoff) hitTimestamps.shift();
-    if (hitTimestamps.length >= BURST_TIGHTEN_COUNT) {
-      dynamicMs = Math.max(minMs, Math.floor(baseMs * 0.66));
-    }
-
-    const wait = withJitter(dynamicMs, Math.min(jitterMs, Math.floor(dynamicMs * 0.2)));
-    timer = setTimeout(tick, wait);
-  };
-
-  const tick = async () => {
+  const loop = async () => {
     try {
-      const rows: AidRow[] = (await fetchAidSince(lastSeenId || undefined)) as any;
-
-      // Prime on first run to avoid historical spam
-      if (lastSeenId === 0) {
-        let maxId = 0;
-        for (const r of rows) maxId = Math.max(maxId, Number(r.id || 0));
-        lastSeenId = maxId;
-        console.log(`Bank radar primed at id=${lastSeenId}`);
-        return scheduleNext();
-      }
-
-      // Only deposits into nations (captures nation→nation and alliance→nation)
-      const hits = rows.filter((r) => r && r.receiver_type === "NATION");
-
-      let newMax = lastSeenId;
-      let postedCount = 0;
-
-      // Preload guild settings
-      const guilds = [...client.guilds.cache.values()];
-      const settingsByGuild: Record<string, Awaited<ReturnType<typeof getGuildSettings>>> = {};
-      for (const g of guilds) {
-        try { settingsByGuild[g.id] = await getGuildSettings(g.id); } catch {}
-      }
-
-      for (const r of hits) {
-        newMax = Math.max(newMax, Number(r.id || 0));
-
-        const amountUSD = await valueUSD(r.resources || null, r.cash || 0);
-
-        for (const g of guilds) {
-          const gs = settingsByGuild[g.id];
-          if (!gs) continue;
-
-          const chanId = gs.alerts_channel_id || gs.deposits_channel_id || gs.alerts_channel || gs.channel_id;
-          if (!chanId) continue;
-
-          const absGuild = Number(gs.deposit_abs_usd || gs.deposit_abs || gs.deposit_threshold_abs_usd || 0);
-          const relGuild = Number(gs.deposit_rel_pct || gs.deposit_threshold_rel_pct || 0);
-          if (!passThreshold(amountUSD, absGuild, relGuild)) continue;
-
-          const senderIsAlliance = r.sender_type === "ALLIANCE";
-          const senderUrl = senderIsAlliance ? allianceLink(r.sender_id) : nationLink(r.sender_id);
-          const receiverUrl = nationLink(r.receiver_id);
-
-          const embed = new EmbedBuilder()
-            .setColor(0x00e676)
-            .setTitle("💰 Large Deposit Detected")
-            .setDescription(
-              `${senderIsAlliance ? "Alliance" : "Nation"} → Nation transfer\n` +
-              `**Amount:** ${formatUSD(amountUSD)}\n` +
-              `**From:** ${senderIsAlliance ? `[Alliance #${r.sender_id}](${senderUrl})` : `[Nation #${r.sender_id}](${senderUrl})`}\n` +
-              `**To:** [Nation #${r.receiver_id}](${receiverUrl})`
-            )
-            .setFooter({ text: `Aid ID ${r.id} • Bank Radar` })
-            .setTimestamp(new Date(r.created_at || Date.now()));
-
-          const mention = gs.alerts_mention_role_id ? `<@&${gs.alerts_mention_role_id}> ` : "";
-
-          try {
-            const channel = (await client.channels.fetch(chanId).catch(() => null)) as TextBasedChannel | null;
-            if (channel && "send" in channel && typeof (channel as any).send === "function") {
-              await (channel as any).send({ content: mention || undefined, embeds: [embed] });
-              postedCount++;
-            }
-          } catch (e) {
-            console.error("Bank radar channel send error:", e);
-          }
-
-          // DM watchers of the RECEIVER nation (opt-in)
-          try {
-            const { rows: watchers } = await query<{
-              discord_user_id: string;
-              dm_enabled: boolean;
-            }>(
-              "select discord_user_id, dm_enabled from watchlist where nation_id=$1 and (dm_enabled is true)",
-              [r.receiver_id]
-            );
-
-            for (const w of watchers) {
-              try {
-                const u = await client.users.fetch(w.discord_user_id);
-                await u.send({ embeds: [embed] });
-              } catch {
-                // ignore DM failures
-              }
-            }
-          } catch (e) {
-            console.error("Bank radar DM error:", e);
-          }
-        }
-      }
-
-      if (newMax > lastSeenId) {
-        lastSeenId = newMax;
-        lastHitTs = nowSec();
-        hitTimestamps.push(lastHitTs);
-      }
-
-      console.log(
-        `Bank radar tick — new=${postedCount} lastSeenId=${lastSeenId} interval=${Math.round(dynamicMs / 1000)}s`
-      );
+      await runOnce(client);
     } catch (e) {
-      console.error("Bank radar error:", e);
-    } finally {
-      scheduleNext();
+      console.error("Aid poller error:", e);
     }
   };
 
-  // initial schedule
-  scheduleNext();
+  loop();
+  const ms = Number(process.env.AID_POLL_MS ?? 90_000);
+  setInterval(loop, ms);
+}
 
-  // graceful stop
-  const stop = () => { if (timer) clearTimeout(timer); };
-  process.once("SIGINT", stop);
-  process.once("SIGTERM", stop);
+/** One polling iteration */
+async function runOnce(client: Client) {
+  const guildId =
+    (process.env.ALLOWED_GUILDS || "")
+      .split(",")
+      .map((s) => s.trim())
+      .filter(Boolean)[0] || "";
+
+  if (!guildId) return;
+
+  const guild =
+    client.guilds.cache.get(guildId) ||
+    (await client.guilds.fetch(guildId).catch(() => null));
+  if (!guild) return;
+
+  const gs = await getGuildSettings(guildId);
+  if (!gs.alerts_enabled || !gs.deposits_enabled) return;
+
+  // ---- cursor (what we've seen so far) ----
+  const cur = await query("SELECT last_aid_id, last_seen_at FROM aid_cursor WHERE id=1");
+  const lastAidId: number | undefined = cur.rows[0]?.last_aid_id ?? undefined;
+  const lastSeenIso: string | undefined = cur.rows[0]?.last_seen_at ?? undefined;
+
+  // ---- fetch newest aid/deposits since the cursor ----
+  const aid = await fetchAidSince(lastAidId, lastSeenIso);
+  if (!aid.length) return;
+
+  const prices = await fetchPriceMap();
+
+  // all linked raider nations (for in/near-range routing if needed)
+  const raiders = await query(
+    "SELECT discord_user_id, nation_id FROM user_nation WHERE is_primary=true"
+  );
+  const raiderIds = raiders.rows
+    .map((r) => Number(r.nation_id))
+    .filter(Number.isFinite);
+
+  // Try to get/create the bank radar channel
+  const bankChannel = await ensureTextChannel(
+    guild,
+    gs.deposits_channel_id || null,
+    "bank-radar"
+  );
+
+  // process oldest → newest so the cursor always moves forward
+  const ordered = [...aid].sort((a, b) => a.id - b.id);
+  let newestId = lastAidId ?? 0;
+  let newestTs: string | undefined = lastSeenIso;
+
+  for (const ev of ordered) {
+    newestId = Math.max(newestId, ev.id);
+    newestTs = ev.sentAt;
+
+    const notional = computeNotionalUSD(ev, prices);
+
+    // Guild floor thresholds (use your *actual* columns)
+    const absGuild = Number(gs.deposit_threshold_abs_usd ?? 0);
+    const relGuild = Number(gs.deposit_threshold_rel_pct ?? 0);
+
+    // NOTE: relGuild not used yet (v1); future: compare to loot p50/avg
+    const floor = absGuild > 0 ? absGuild : 10_000_000;
+    if (notional < floor) continue;
+
+    // dedupe by id+receiver+rounded notional
+    const hash = `bank-${ev.id}-${ev.receiverId}-${Math.round(notional)}`;
+    const { rows: existing } = await query(
+      "SELECT 1 FROM alert_log WHERE message_hash=$1",
+      [hash]
+    );
+    if (existing.length) continue;
+
+    // fetch target + relevant raiders for in/near-range checks
+    const nationMap = await fetchNationMap([ev.receiverId, ...raiderIds]);
+    const target = nationMap[ev.receiverId];
+
+    // Optional in/near-range gate for channel posts:
+    // if you later add a boolean to guild_settings (e.g., inrange_only),
+    // you can read it here. For now, always allow channel posts.
+    let anyInRange = true;
+    if (target && typeof target.score === "number") {
+      const nearPct = gs.near_range_pct ?? 5;
+      // uncomment to enable guild-level in/near-range gating:
+      // anyInRange = raiderIds.some((rid) => {
+      //   const rn = nationMap[rid];
+      //   if (!rn || typeof rn.score !== "number") return false;
+      //   const s = rangeStatus(rn.score, target.score, nearPct);
+      //   return s.inRange || s.nearRange;
+      // });
+    }
+
+    if (!anyInRange) {
+      // still advance cursor, but skip posting
+      continue;
+    }
+
+    // Build channel payload (with 🔔 button)
+    const payload = depositAlertEmbed({
+      nationId: ev.receiverId,
+      nationName: ev.receiverName,
+      senderId: ev.senderId ?? undefined,
+      senderName: ev.senderName ?? undefined,
+      notionalUSD: Math.round(notional),
+      breakdown: buildBreakdown(ev),
+      whenText: timeAgo(ev.sentAt),
+    });
+    const components = [...(payload.components ?? [])];
+    components.push(bankRowWithWatch(ev.receiverId));
+
+    // Channel post
+    if (bankChannel) {
+      await bankChannel
+        .send({
+          ...payload,
+          components,
+          allowedMentions: { parse: [] },
+        })
+        .catch(() => null);
+    }
+
+    // DM watchers of this nation (per-user thresholds & inrange_only respected)
+    const watchers = await watchersForNation(ev.receiverId);
+    if (watchers.length && target && typeof target.score === "number") {
+      const targetScore = target.score;
+      for (const w of watchers) {
+        const member = await guild.members
+          .fetch(w.discord_user_id)
+          .catch(() => null);
+        const user = member?.user;
+        if (!user) continue;
+
+        // per-user threshold: fall back to guild floor
+        const myFloor = Number(w.bank_abs_usd ?? floor);
+        if (notional < myFloor) continue;
+
+        // in/near-range filter (per-user)
+        if (w.inrange_only) {
+          // need their attacker score
+          const myNation = await query(
+            "SELECT nation_id FROM user_nation WHERE discord_user_id=$1 AND is_primary=true LIMIT 1",
+            [w.discord_user_id]
+          );
+          const nid = myNation.rows[0]?.nation_id;
+          if (!nid) continue;
+          const attacker = nationMap[nid];
+          if (!attacker || typeof attacker.score !== "number") continue;
+
+          const s = rangeStatus(attacker.score, targetScore, gs.near_range_pct ?? 5);
+          if (!s.inRange && !s.nearRange) continue;
+        }
+
+        await user
+          .send({
+            ...payload,
+            components,
+            allowedMentions: { parse: [] },
+          })
+          .catch(() => null);
+
+        await query(
+          "INSERT INTO alert_log (event_type, nation_id, notional_value, message_hash) VALUES ($1,$2,$3,$4)",
+          ["deposit_watch_dm", ev.receiverId, Math.round(notional), `${hash}-u${w.discord_user_id}`]
+        );
+      }
+    }
+
+    // log
+    await query(
+      "INSERT INTO alert_log (event_type, nation_id, notional_value, message_hash) VALUES ($1,$2,$3,$4)",
+      ["deposit", ev.receiverId, Math.round(notional), hash]
+    );
+  }
+
+  // advance cursor
+  await query(
+    "UPDATE aid_cursor SET last_aid_id=$1, last_seen_at=$2 WHERE id=1",
+    [newestId || null, newestTs || null]
+  );
+}
+
+/** USD notional based on resource market prices */
+function computeNotionalUSD(ev: any, priceMap: Record<string, number>) {
+  let total = Number(ev.cash ?? 0);
+  const resources = [
+    "food",
+    "munitions",
+    "steel",
+    "oil",
+    "aluminum",
+    "uranium",
+    "gasoline",
+    "coal",
+    "iron",
+    "bauxite",
+  ];
+  for (const r of resources) {
+    const qty = Number(ev[r] ?? 0);
+    if (!qty) continue;
+    const p = Number(priceMap[r] ?? 0);
+    if (!p) continue;
+    total += qty * p;
+  }
+  return total;
+}
+
+function buildBreakdown(ev: any) {
+  const parts: string[] = [];
+  if (ev.cash) parts.push(`$${fmt(ev.cash)} cash`);
+  const add = (k: string, label?: string) => {
+    const v = Number(ev[k] ?? 0);
+    if (v) parts.push(`${fmt(v)} ${label || k}`);
+  };
+  add("food");
+  add("munitions");
+  add("steel");
+  add("oil");
+  add("aluminum");
+  add("uranium");
+  add("gasoline");
+  add("coal");
+  add("iron");
+  add("bauxite");
+  return parts.join(" • ");
+}
+
+function fmt(n: number) {
+  return Intl.NumberFormat("en-US", { maximumFractionDigits: 0 }).format(n);
+}
+
+function timeAgo(iso: string | undefined) {
+  if (!iso) return "just now";
+  const then = new Date(iso).getTime();
+  const now = Date.now();
+  const s = Math.max(1, Math.round((now - then) / 1000));
+  if (s < 60) return `${s}s ago`;
+  const m = Math.round(s / 60);
+  if (m < 60) return `${m}m ago`;
+  const h = Math.round(m / 60);
+  return `${h}h ago`;
+}
+
+function rangeStatus(attackerScore: number, targetScore: number, nearPct: number) {
+  const min = targetScore * DECL_MIN;
+  const max = targetScore * DECL_MAX;
+  const inRange = attackerScore >= min && attackerScore <= max;
+  const nearRange =
+    !inRange &&
+    attackerScore >= min * (1 - nearPct / 100) &&
+    attackerScore <= max * (1 + nearPct / 100);
+  return { inRange, nearRange, min, max };
+}
+
+/** Ensure we have a text channel to post bank radar alerts to */
+async function ensureTextChannel(
+  guild: Guild,
+  channelId: string | null,
+  fallbackName: string
+): Promise<TextChannel | null> {
+  if (channelId) {
+    const byId = (await guild.channels.fetch(channelId).catch(() => null)) as TextChannel | null;
+    if (byId && byId.type === ChannelType.GuildText) return byId;
+  }
+
+  // try to find by name
+  const existing = guild.channels.cache.find(
+    (c) => c.type === ChannelType.GuildText && c.name === fallbackName
+  ) as TextChannel | undefined;
+  if (existing) return existing;
+
+  // try to create (requires permission)
+  const created = (await guild.channels
+    .create({
+      name: fallbackName,
+      type: ChannelType.GuildText,
+      reason: "PNW Raider: bank radar channel",
+    })
+    .catch(() => null)) as TextChannel | null;
+
+  return created;
 }
