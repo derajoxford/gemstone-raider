@@ -1,5 +1,5 @@
 // src/pnw/client.ts
-// Minimal PNW client for the Raider bot using GraphQL `bankrecs` and REST prices.
+// PNW client for the Raider bot using GraphQL `bankrecs` (IDs only) and REST prices.
 
 type Json = Record<string, any>;
 
@@ -8,8 +8,6 @@ const REST_BASE = (process.env.PNW_API_BASE_REST || "https://politicsandwar.com/
 const API_KEY   = process.env.PNW_API_KEY || "";
 
 if (!API_KEY) {
-  // Don't throw here — callers will see empty results, but we log loudly.
-  // Service env must provide PNW_API_KEY.
   console.error("[pnw/client] WARNING: PNW_API_KEY is empty.");
 }
 
@@ -57,7 +55,7 @@ export async function fetchPriceMap(): Promise<Record<string, number>> {
   return out;
 }
 
-/** Normalized row the rest of the bot expects (historically from 'aid'). */
+/** Normalized row (old ‘aid-like’ shape the bot uses downstream). */
 export type AidLikeRow = {
   id: number;
   sentAt: string;
@@ -65,7 +63,6 @@ export type AidLikeRow = {
   senderName?: string | null;
   receiverId: number;
   receiverName: string;
-  // amounts in native units; 'cash' is money
   cash: number;
   food: number;
   munitions: number;
@@ -77,21 +74,16 @@ export type AidLikeRow = {
   coal: number;
   iron: number;
   bauxite: number;
-  // lead exists on Bankrec but we don't currently price it in alerts
   lead?: number;
   note?: string | null;
 };
 
 /**
- * Back-compat function name: fetchAidSince
- * Internally reads the Bankrec paginator, newest-first (by ID desc),
- * then we client-filter by (lastId, sinceIso) if provided.
- *
- * NOTE: Some Bankrec rows (e.g., war loot) are still legitimate nation
- *       deposits from our perspective; we don't filter them out here.
+ * Back-compat name: fetchAidSince
+ * Reads Bankrec (newest first), then client-filters by lastId/sinceIso.
+ * We only request sender/receiver IDs (no name field in this schema).
  */
 export async function fetchAidSince(lastId?: number, sinceIso?: string): Promise<AidLikeRow[]> {
-  // Ask for the latest N rows; we’ll filter locally against lastId/sinceIso.
   const LIMIT = 50;
 
   const QUERY = /* GraphQL */ `
@@ -102,8 +94,8 @@ export async function fetchAidSince(lastId?: number, sinceIso?: string): Promise
           date
           sender_type
           receiver_type
-          sender { id name }
-          receiver { id name }
+          sender { id }
+          receiver { id }
           note
           money
           food
@@ -127,8 +119,8 @@ export async function fetchAidSince(lastId?: number, sinceIso?: string): Promise
     date: string;
     sender_type: number;
     receiver_type: number;
-    sender: { id: string; name: string } | null;
-    receiver: { id: string; name: string } | null;
+    sender: { id: string } | null;
+    receiver: { id: string } | null;
     note?: string | null;
     money?: number;
     food?: number;
@@ -149,30 +141,32 @@ export async function fetchAidSince(lastId?: number, sinceIso?: string): Promise
 
   const sinceMs = sinceIso ? Date.parse(sinceIso) : undefined;
 
-  // Normalize to the 'aid-like' shape the rest of the bot already uses.
-  const mapped: AidLikeRow[] = rows.map((r) => ({
-    id: Number(r.id),
-    sentAt: r.date,
-    senderId: r.sender ? Number(r.sender.id) : null,
-    senderName: r.sender?.name ?? null,
-    receiverId: r.receiver ? Number(r.receiver.id) : 0,
-    receiverName: r.receiver?.name ?? "Unknown",
-    cash: Number(r.money ?? 0),
-    food: Number(r.food ?? 0),
-    munitions: Number(r.munitions ?? 0),
-    steel: Number(r.steel ?? 0),
-    oil: Number(r.oil ?? 0),
-    aluminum: Number(r.aluminum ?? 0),
-    uranium: Number(r.uranium ?? 0),
-    gasoline: Number(r.gasoline ?? 0),
-    coal: Number(r.coal ?? 0),
-    iron: Number(r.iron ?? 0),
-    bauxite: Number(r.bauxite ?? 0),
-    lead: Number(r.lead ?? 0),
-    note: r.note ?? null,
-  }));
+  const mapped: AidLikeRow[] = rows.map((r) => {
+    const sid = r.sender ? Number(r.sender.id) : null;
+    const rid = r.receiver ? Number(r.receiver.id) : 0;
+    return {
+      id: Number(r.id),
+      sentAt: r.date,
+      senderId: sid,
+      senderName: sid ? `#${sid}` : null,
+      receiverId: rid,
+      receiverName: rid ? `#${rid}` : "Unknown",
+      cash: Number(r.money ?? 0),
+      food: Number(r.food ?? 0),
+      munitions: Number(r.munitions ?? 0),
+      steel: Number(r.steel ?? 0),
+      oil: Number(r.oil ?? 0),
+      aluminum: Number(r.aluminum ?? 0),
+      uranium: Number(r.uranium ?? 0),
+      gasoline: Number(r.gasoline ?? 0),
+      coal: Number(r.coal ?? 0),
+      iron: Number(r.iron ?? 0),
+      bauxite: Number(r.bauxite ?? 0),
+      lead: Number(r.lead ?? 0),
+      note: r.note ?? null,
+    };
+  });
 
-  // Client-side filter using lastId / sinceIso if given.
   const filtered = mapped.filter((m) => {
     if (lastId && m.id <= lastId) return false;
     if (sinceMs && Date.parse(m.sentAt) <= sinceMs) return false;
@@ -181,3 +175,4 @@ export async function fetchAidSince(lastId?: number, sinceIso?: string): Promise
 
   return filtered;
 }
+
