@@ -8,16 +8,14 @@ import type { Client, TextBasedChannel } from "discord.js";
 import { EmbedBuilder } from "discord.js";
 import { query } from "../data/db.js";
 import { getGuildSettings } from "../data/settings.js";
-// PNW API client (existing in repo)
 import { fetchAidSince, fetchPriceMap } from "../pnw/client.js";
 
-// ---- helpers ----
 const ms = (n: number) => Math.max(0, Math.floor(n));
 const nowSec = () => Math.floor(Date.now() / 1000);
 const withJitter = (baseMs: number, jitterMs: number) =>
   ms(baseMs + (Math.random() * 2 - 1) * jitterMs);
 
-// env knobs (fallbacks match what we put in /etc/pnw-raider.env)
+// env knobs (fallbacks match /etc/pnw-raider.env)
 const POLL_SEC = Number(process.env.DEPOSITS_POLL_SEC || "15");
 const POLL_MIN_SEC = Number(process.env.DEPOSITS_POLL_MIN_SEC || "10");
 const POLL_MAX_SEC = Number(process.env.DEPOSITS_POLL_MAX_SEC || "45");
@@ -29,21 +27,18 @@ const BURST_WINDOW_SEC = Number(process.env.DEPOSITS_BURST_WINDOW_SEC || "60");
 // thresholds
 const ABS_USD_DEFAULT = Number(process.env.DEPOSIT_THRESHOLD_ABS_USD || "100000000");
 const REL_PCT_DEFAULT = Number(process.env.DEPOSIT_THRESHOLD_REL_PCT || "20");
-// If you later set this env, REL threshold will apply as: amount >= LOOT_P50_USD * REL_PCT/100
+// Optional: if set, REL threshold is LOOT_P50_USD * relPct / 100
 const LOOT_P50_USD = Number(process.env.LOOT_P50_USD || "0");
 
 type AidRow = {
   id: number;
-  // sender can be nation or alliance; we include both
   sender_type: "NATION" | "ALLIANCE";
   sender_id: number;
   receiver_type: "NATION" | "ALLIANCE";
   receiver_id: number;
-  // values
   cash: number;
-  // resources shape is client-defined; we treat dynamically
   resources?: Record<string, number> | null;
-  created_at: string; // iso
+  created_at: string; // ISO
 };
 
 async function valueUSD(resources: Record<string, number> | null | undefined, cash: number): Promise<number> {
@@ -52,7 +47,7 @@ async function valueUSD(resources: Record<string, number> | null | undefined, ca
   if (resources) {
     for (const [k, v] of Object.entries(resources)) {
       const qty = Number(v || 0);
-      const p = Number(price[k] || 0);
+      const p = Number((price as any)[k] || 0);
       if (!Number.isFinite(qty) || qty <= 0) continue;
       total += qty * p;
     }
@@ -61,8 +56,8 @@ async function valueUSD(resources: Record<string, number> | null | undefined, ca
 }
 
 function passThreshold(amountUSD: number, absGuild?: number, relGuildPct?: number): boolean {
-  const abs = Number.isFinite(absGuild) && absGuild! > 0 ? (absGuild as number) : ABS_USD_DEFAULT;
-  const relPct = Number.isFinite(relGuildPct) && relGuildPct! > 0 ? (relGuildPct as number) : REL_PCT_DEFAULT;
+  const abs = Number.isFinite(absGuild) && (absGuild as number) > 0 ? (absGuild as number) : ABS_USD_DEFAULT;
+  const relPct = Number.isFinite(relGuildPct) && (relGuildPct as number) > 0 ? (relGuildPct as number) : REL_PCT_DEFAULT;
   if (amountUSD >= abs) return true;
   if (LOOT_P50_USD > 0 && amountUSD >= (LOOT_P50_USD * relPct) / 100) return true;
   return false;
@@ -80,25 +75,25 @@ function allianceLink(id: number) {
 }
 
 export function startAidPoller(client: Client) {
-  // in-memory watermark; on first tick we initialize to latest id to avoid spamming historical rows
   let lastSeenId = 0;
   let lastHitTs = 0;
-  const hitTimestamps: number[] = []; // for burst detection
+  const hitTimestamps: number[] = [];
 
   const baseMs = ms(POLL_SEC * 1000);
   const minMs = ms(POLL_MIN_SEC * 1000);
   const maxMs = ms(POLL_MAX_SEC * 1000);
   const jitterMs = ms(POLL_JITTER_SEC * 1000);
 
-  let dynamicMs = baseMs;
+  let dynamicMs = baseMs;             // <-- only declared here
   let timer: NodeJS.Timeout | null = null;
 
   const scheduleNext = () => {
-    // quiet backoff
+    // quiet backoff (no hits for a while)
     if (lastHitTs && nowSec() - lastHitTs >= QUIET_BACKOFF_SEC) {
       dynamicMs = Math.min(maxMs, Math.max(dynamicMs, baseMs * 2));
     }
-    // burst tighten
+
+    // burst tighten (lots of hits recently)
     const cutoff = nowSec() - BURST_WINDOW_SEC;
     while (hitTimestamps.length && hitTimestamps[0] < cutoff) hitTimestamps.shift();
     if (hitTimestamps.length >= BURST_TIGHTEN_COUNT) {
@@ -111,9 +106,9 @@ export function startAidPoller(client: Client) {
 
   const tick = async () => {
     try {
-      // Pull aid since lastSeenId (client handles pagination internally)
-      const rows: AidRow[] = await fetchAidSince(lastSeenId || undefined) as any;
-      // If we have no watermark yet, prime it to the latest and skip alerting old rows
+      const rows: AidRow[] = (await fetchAidSince(lastSeenId || undefined)) as any;
+
+      // Prime on first run to avoid historical spam
       if (lastSeenId === 0) {
         let maxId = 0;
         for (const r of rows) maxId = Math.max(maxId, Number(r.id || 0));
@@ -122,13 +117,13 @@ export function startAidPoller(client: Client) {
         return scheduleNext();
       }
 
-      // New rows (ascending). Filter to receiver = NATION only.
+      // Only deposits into nations (captures nation→nation and alliance→nation)
       const hits = rows.filter((r) => r && r.receiver_type === "NATION");
 
       let newMax = lastSeenId;
       let postedCount = 0;
 
-      // Preload guild settings map to avoid per-row DB calls
+      // Preload guild settings
       const guilds = [...client.guilds.cache.values()];
       const settingsByGuild: Record<string, Awaited<ReturnType<typeof getGuildSettings>>> = {};
       for (const g of guilds) {
@@ -138,10 +133,8 @@ export function startAidPoller(client: Client) {
       for (const r of hits) {
         newMax = Math.max(newMax, Number(r.id || 0));
 
-        // compute USD
         const amountUSD = await valueUSD(r.resources || null, r.cash || 0);
 
-        // for each guild, evaluate thresholds and post
         for (const g of guilds) {
           const gs = settingsByGuild[g.id];
           if (!gs) continue;
@@ -149,18 +142,16 @@ export function startAidPoller(client: Client) {
           const chanId = gs.alerts_channel_id || gs.deposits_channel_id || gs.alerts_channel || gs.channel_id;
           if (!chanId) continue;
 
-          // Guild-specific thresholds (if stored): deposit_abs_usd, deposit_rel_pct
           const absGuild = Number(gs.deposit_abs_usd || gs.deposit_abs || gs.deposit_threshold_abs_usd || 0);
           const relGuild = Number(gs.deposit_rel_pct || gs.deposit_threshold_rel_pct || 0);
           if (!passThreshold(amountUSD, absGuild, relGuild)) continue;
 
-          // Build embed
           const senderIsAlliance = r.sender_type === "ALLIANCE";
           const senderUrl = senderIsAlliance ? allianceLink(r.sender_id) : nationLink(r.sender_id);
           const receiverUrl = nationLink(r.receiver_id);
 
           const embed = new EmbedBuilder()
-            .setColor(0x00E676)
+            .setColor(0x00e676)
             .setTitle("💰 Large Deposit Detected")
             .setDescription(
               `${senderIsAlliance ? "Alliance" : "Nation"} → Nation transfer\n` +
@@ -171,20 +162,19 @@ export function startAidPoller(client: Client) {
             .setFooter({ text: `Aid ID ${r.id} • Bank Radar` })
             .setTimestamp(new Date(r.created_at || Date.now()));
 
-          // Optional mention role
           const mention = gs.alerts_mention_role_id ? `<@&${gs.alerts_mention_role_id}> ` : "";
 
           try {
-            const channel = await client.channels.fetch(chanId).catch(() => null) as TextBasedChannel | null;
-            if (channel && "send" in channel && typeof channel.send === "function") {
-              await channel.send({ content: mention || undefined, embeds: [embed] });
+            const channel = (await client.channels.fetch(chanId).catch(() => null)) as TextBasedChannel | null;
+            if (channel && "send" in channel && typeof (channel as any).send === "function") {
+              await (channel as any).send({ content: mention || undefined, embeds: [embed] });
               postedCount++;
             }
           } catch (e) {
             console.error("Bank radar channel send error:", e);
           }
 
-          // DM watchers of the RECEIVER nation (if they opted-in)
+          // DM watchers of the RECEIVER nation (opt-in)
           try {
             const { rows: watchers } = await query<{
               discord_user_id: string;
@@ -198,8 +188,8 @@ export function startAidPoller(client: Client) {
               try {
                 const u = await client.users.fetch(w.discord_user_id);
                 await u.send({ embeds: [embed] });
-              } catch (e) {
-                // ignore DM failures (privacy settings etc.)
+              } catch {
+                // ignore DM failures
               }
             }
           } catch (e) {
@@ -214,7 +204,9 @@ export function startAidPoller(client: Client) {
         hitTimestamps.push(lastHitTs);
       }
 
-      console.log(`Bank radar tick — new=${postedCount} lastSeenId=${lastSeenId} interval=${Math.round(dynamicMs/1000)}s`);
+      console.log(
+        `Bank radar tick — new=${postedCount} lastSeenId=${lastSeenId} interval=${Math.round(dynamicMs / 1000)}s`
+      );
     } catch (e) {
       console.error("Bank radar error:", e);
     } finally {
@@ -223,7 +215,6 @@ export function startAidPoller(client: Client) {
   };
 
   // initial schedule
-  let dynamicMs = baseMs;
   scheduleNext();
 
   // graceful stop
