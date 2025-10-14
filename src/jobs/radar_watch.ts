@@ -1,7 +1,7 @@
 // src/jobs/radar_watch.ts
 // Watch / Beige radar loop WITHOUT GuildMembers intent.
-// - No guild.members.fetch() calls
-// - Safe to run with only GatewayIntentBits.Guilds
+// - No guild.members.fetch()
+// - Safe with only GatewayIntentBits.Guilds
 // - Logs a periodic tick so you can verify cadence
 // - Placeholder for beige exit logic & per-user DMs using client.users.fetch()
 
@@ -28,7 +28,7 @@ export function startWatchRadar(client: Client) {
       console.log(`Watch radar tick — watchers=${watchers}`);
 
       // TODO: implement beige exit ETA & target checks here
-      // 1) Pull active watches
+      // 1) Pull active watches:
       //    const { rows: w } = await query("select discord_user_id, nation_id, dm_enabled from watchlist");
       // 2) For each nation_id, fetch status from PNW API (no guild member fetch!)
       // 3) If approaching beige exit / in-window, DM the user:
@@ -42,10 +42,10 @@ export function startWatchRadar(client: Client) {
     }
   };
 
-  // initial kick, slight delay to avoid racing login
+  // initial kick after a short delay
   timer = setTimeout(tick, withJitter(Math.min(baseMs, 5000), 0.30));
 
-  // graceful stop on process end
+  // graceful stop
   const stop = () => { if (timer) clearTimeout(timer); };
   process.once("SIGINT", stop);
   process.once("SIGTERM", stop);
