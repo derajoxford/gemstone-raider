@@ -1,13 +1,20 @@
-import type { ChatInputCommandInteraction } from "discord.js";
+// src/types/command.ts
+import type {
+  SlashCommandBuilder,
+  SlashCommandSubcommandsOnlyBuilder,
+  ChatInputCommandInteraction,
+  ButtonInteraction,
+  ModalSubmitInteraction,
+} from "discord.js";
 
-/**
- * Keep this liberal so both simple commands and subcommand-based builders work.
- * We accept any slash-like builder object that has .toJSON() at register time.
- */
-export interface Command {
-  // Using 'any' here avoids TS friction between SlashCommandBuilder vs
-  // SlashCommandSubcommandsOnlyBuilder across discord.js/@discordjs/builders.
-  data: any;
-  disabled?: boolean;
-  execute: (interaction: ChatInputCommandInteraction) => Promise<void>;
-}
+export type Command = {
+  // Accept either plain builder or the subcommands-only builder
+  data: SlashCommandBuilder | SlashCommandSubcommandsOnlyBuilder;
+
+  // Required: slash command entry
+  execute(i: ChatInputCommandInteraction): Promise<void>;
+
+  // Optional: component handlers
+  handleButton?(i: ButtonInteraction): Promise<boolean>;
+  handleModal?(i: ModalSubmitInteraction): Promise<boolean>;
+};
