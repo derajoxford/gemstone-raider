@@ -184,4 +184,414 @@ function renderDossier(d: Dossier | null): string {
   if (d.aircraft != null) mil.push(`✈️ ${formatNum(d.aircraft)}`);
   if (d.ships != null) mil.push(`🚢 ${formatNum(d.ships)}`);
   if (d.missiles != null) mil.push(`🎯 ${formatNum(d.missiles)}`);
-  if (d.nukes != null
+  if (d.nukes != null) mil.push(`☢️ ${formatNum(d.nukes)}`);
+  if (mil.length) lines.push(`🧷 **Military:** ${mil.join(" / ")}`);
+  if (d.beige != null) lines.push(`🟫 **Beige:** ${formatNum(d.beige)} turns`);
+  return lines.length ? lines.join("\n") : "_No data_";
+}
+
+function formatNum(n: number) {
+  try {
+    if (Math.abs(n) >= 1000) return Intl.NumberFormat("en-US").format(Math.round(n));
+    return `${n}`;
+  } catch {
+    return `${n}`;
+  }
+}
+
+function controlEmbed(opts: {
+  nationName: string;
+  openerId: string;
+  targetUrl: string;
+  notes?: string | null;
+  members: string[];
+  dossier?: Dossier | null;
+}) {
+  const preview =
+    opts.members.length > 0
+      ? opts.members.slice(0, 10).map((id) => userMention(id)).join(" • ")
+      : "_none_";
+
+  const emb = new EmbedBuilder()
+    .setColor(0xd32f2f) // brand red
+    .setTitle(`💥 WAR ROOM — ${opts.nationName}`)
+    .setDescription(`🎯 **Target:** [${opts.nationName}](${opts.targetUrl})\n👤 **Created by:** ${userMention(opts.openerId)}`)
+    .addFields({ name: "👥 Members", value: preview })
+    .setFooter({ text: "Admins: Add/Remove members • Refresh Dossier • Close War Room" })
+    .setTimestamp(Date.now());
+
+  if (opts.notes && opts.notes.trim()) {
+    emb.addFields({ name: "📝 Notes", value: opts.notes.trim().slice(0, 1024) });
+  }
+
+  // Dossier (append or placeholder)
+  const dossierTxt = renderDossier(opts.dossier ?? null);
+  emb.addFields({ name: "📊 Dossier", value: dossierTxt });
+
+  return emb;
+}
+
+function canManage(member: GuildMember, creatorId: string) {
+  return member.id === creatorId || member.permissions.has(PermissionFlagsBits.ManageChannels);
+}
+
+async function refreshControlEmbed(ch: TextChannel, roomId: number, dossier: Dossier | null = null) {
+  const { rows } = await query("SELECT * FROM war_rooms WHERE id=$1", [roomId]);
+  const wr = rows[0];
+  if (!wr) return;
+  const msgId: string | null = wr.control_message_id;
+  if (!msgId) return;
+  const msg = await ch.messages.fetch(msgId).catch(() => null);
+  if (!msg) return;
+
+  const emb = controlEmbed({
+    nationName: wr.target_nation_name,
+    openerId: wr.created_by_id,
+    targetUrl: `https://politicsandwar.com/nation/id=${wr.target_nation_id}`,
+    notes: wr.notes,
+    members: wr.member_ids || [],
+    dossier,
+  });
+  await msg.edit({ embeds: [emb], components: [controlButtons(roomId)] }).catch(() => {});
+}
+
+async function tryUpdateDossier(roomId: number) {
+  // Load war room
+  const { rows } = await query("SELECT * FROM war_rooms WHERE id=$1", [roomId]);
+  const wr = rows[0];
+  if (!wr) return;
+
+  // Fetch channel + message
+  const ch = (await globalThis
+    .__discordClient?.channels?.fetch(wr.channel_id)
+    .catch(() => null)) as TextChannel | null;
+  if (!ch) return;
+
+  const dossier = await fetchNationDossier(wr.target_nation_id).catch(() => null);
+  await refreshControlEmbed(ch, roomId, dossier);
+}
+
+// expose client to this module for post-create dossier update
+declare global {
+  // eslint-disable-next-line no-var
+  var __discordClient: any;
+}
+
+/* ---------- Command ---------- */
+
+const cmd: Cmd = {
+  data: new SlashCommandBuilder()
+    .setName("warroom")
+    .setDescription("Create/manage a War Room (modal collects notes)")
+    .addSubcommand((sc) => {
+      let b = sc
+        .setName("setup")
+        .setDescription("Select target + up to 10 members, then add notes in modal")
+        .addStringOption((o) =>
+          o.setName("target").setDescription("Nation ID or full nation URL").setRequired(true),
+        );
+      for (let i = 1; i <= 10; i++) {
+        b = b.addUserOption((o) => o.setName(`member${i}`).setDescription(`Add member #${i}`).setRequired(false));
+      }
+      return b;
+    }),
+
+  async execute(i: ChatInputCommandInteraction) {
+    // make client reachable for background dossier update
+    // @ts-ignore
+    globalThis.__discordClient = i.client;
+
+    if (!i.inGuild() || !i.guildId) {
+      await i.reply({ content: "Run this in a server.", ephemeral: true });
+      return;
+    }
+    const sub = i.options.getSubcommand(false);
+    if (sub !== "setup") {
+      await i.reply({ ephemeral: true, content: "Use **/warroom setup**." });
+      return;
+    }
+
+    const raw = i.options.getString("target", true);
+    const norm = normalizeTarget(raw);
+    if (!norm) {
+      await i.reply({ content: "Invalid target. Provide a nation ID or a valid nation URL.", ephemeral: true });
+      return;
+    }
+
+    // Pre-gather up to 10 member IDs
+    const pre: string[] = [];
+    for (let idx = 1; idx <= 10; idx++) {
+      const u = i.options.getUser(`member${idx}`, false);
+      if (u) pre.push(u.id);
+    }
+    const preUnique = Array.from(new Set(pre));
+
+    // Stash for modal submit (keyed by guild:user)
+    pendingSetup.set(setupKey(i.guildId, i.user.id), {
+      targetId: norm.id,
+      targetUrl: norm.url,
+      preMembers: preUnique,
+    });
+
+    // Modal: Notes + Target URL preview (read-only semantics; we ignore edits)
+    const modal = new ModalBuilder().setCustomId("war:setup").setTitle("War Room — Confirm Details");
+
+    const urlPreview = new TextInputBuilder()
+      .setCustomId("target_url_preview")
+      .setLabel("Target URL (for reference)")
+      .setStyle(TextInputStyle.Short)
+      .setRequired(false)
+      .setValue(norm.url.slice(0, 100)); // short input limit ~100 chars
+
+    const notes = new TextInputBuilder()
+      .setCustomId("notes")
+      .setLabel("Notes (visible to everyone)")
+      .setStyle(TextInputStyle.Paragraph)
+      .setRequired(false)
+      .setMaxLength(1024);
+
+    modal.addComponents(
+      new ActionRowBuilder<TextInputBuilder>().addComponents(urlPreview),
+      new ActionRowBuilder<TextInputBuilder>().addComponents(notes),
+    );
+
+    await i.showModal(modal);
+  },
+
+  async handleButton(i: ButtonInteraction): Promise<boolean> {
+    const cid = i.customId || "";
+    if (!cid.startsWith("war:")) return false;
+    if (!i.inGuild() || !i.guildId) return true;
+
+    const [_, action, idStr] = cid.split(":");
+    const roomId = Number(idStr || 0);
+    if (!Number.isFinite(roomId) || roomId <= 0) {
+      await i.reply({ ephemeral: true, content: "Invalid room id." });
+      return true;
+    }
+
+    const me = await i.guild!.members.fetch(i.user.id);
+    const { rows } = await query("SELECT * FROM war_rooms WHERE id=$1", [roomId]);
+    const wr = rows[0];
+    if (!wr) {
+      await i.reply({ ephemeral: true, content: "War Room not found." });
+      return true;
+    }
+
+    // Refresh dossier is allowed for admins/creator; others denied
+    if (action === "refresh") {
+      if (!canManage(me, wr.created_by_id)) {
+        await i.reply({ ephemeral: true, content: "You can't refresh the dossier." });
+        return true;
+      }
+      await i.deferReply({ ephemeral: true });
+      // Try fetch & update
+      const dossier = await fetchNationDossier(wr.target_nation_id).catch(() => null);
+      const ch = (await i.client.channels.fetch(wr.channel_id).catch(() => null)) as TextChannel | null;
+      if (ch) await refreshControlEmbed(ch, roomId, dossier);
+      await i.editReply(dossier ? "📊 Dossier refreshed." : "No dossier data available right now.");
+      return true;
+    }
+
+    if (!canManage(me, wr.created_by_id)) {
+      await i.reply({ ephemeral: true, content: "You can't manage this War Room." });
+      return true;
+    }
+
+    if (action === "close") {
+      await i.deferReply({ ephemeral: true });
+      await query("DELETE FROM war_rooms WHERE id=$1", [roomId]).catch(() => {});
+      const ch = (await i.client.channels.fetch(wr.channel_id).catch(() => null)) as TextChannel | null;
+      if (ch) await ch.delete("War Room closed").catch(() => {});
+      await i.editReply("✅ Closed.");
+      return true;
+    }
+
+    if (action === "add" || action === "remove") {
+      const modal = new ModalBuilder()
+        .setCustomId(`war:${action}:modal:${roomId}`)
+        .setTitle(action === "add" ? "Add Members" : "Remove Members");
+      const field = new TextInputBuilder()
+        .setCustomId("members")
+        .setLabel("Members (mentions or IDs, space/newline separated)")
+        .setStyle(TextInputStyle.Paragraph)
+        .setRequired(true);
+      modal.addComponents(new ActionRowBuilder<TextInputBuilder>().addComponents(field));
+      await i.showModal(modal);
+      return true;
+    }
+
+    return true;
+  },
+
+  async handleModal(i: ModalSubmitInteraction): Promise<boolean> {
+    if (!i.inGuild() || !i.guildId) return false;
+
+    // Finalize creation
+    if (i.customId === "war:setup") {
+      const key = setupKey(i.guildId!, i.user.id);
+      const cached = pendingSetup.get(key);
+      if (!cached) {
+        await i.reply({ ephemeral: true, content: "Setup expired. Re-run /warroom setup." });
+        return true;
+      }
+
+      await i.deferReply({ ephemeral: true });
+
+      const { targetId, targetUrl, preMembers } = cached;
+
+      // Resolve nation name (fallback to #ID if API fails)
+      const nationName = (await fetchNationName(targetId)) ?? `Nation #${targetId}`;
+
+      // Validate members exist in guild
+      const initialMembers: string[] = [];
+      for (const uid of preMembers) {
+        try {
+          await i.guild!.members.fetch(uid);
+          initialMembers.push(uid);
+        } catch {}
+      }
+
+      // Ensure/locate category
+      let cat = i.guild!.channels.cache.find(
+        (c) => c.type === ChannelType.GuildCategory && c.name.toUpperCase() === CATEGORY_NAME.toUpperCase(),
+      );
+      if (!cat) {
+        cat = await i.guild!.channels.create({
+          name: CATEGORY_NAME,
+          type: ChannelType.GuildCategory,
+          reason: "War Room category",
+        });
+      }
+
+      // Create channel with overwrites
+      const overwrites: any[] = [
+        { id: i.guild!.roles.everyone.id, deny: ["ViewChannel", "SendMessages", "ReadMessageHistory"] },
+        { id: i.client.user!.id, allow: ["ViewChannel", "SendMessages", "ReadMessageHistory", "ManageChannels", "ManageMessages"] },
+        { id: i.user.id, allow: ["ViewChannel", "SendMessages", "ReadMessageHistory"] },
+        ...initialMembers.map((id) => ({ id, allow: ["ViewChannel", "SendMessages", "ReadMessageHistory"] })),
+      ];
+
+      const ch = await i.guild!.channels.create({
+        name: `wr-${slug(nationName)}`,
+        type: ChannelType.GuildText,
+        parent: cat!.id,
+        permissionOverwrites: overwrites as any,
+        reason: `War Room created by ${i.user.tag}`,
+      });
+
+      const notes = i.fields.getTextInputValue("notes")?.trim() || "";
+
+      // Insert DB row
+      const ins = await query(
+        `INSERT INTO war_rooms
+         (guild_id, channel_id, control_message_id, name, created_by_id,
+          target_nation_id, target_nation_name, notes, member_ids)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
+         RETURNING id`,
+        [
+          i.guildId!,
+          ch.id,
+          null,
+          nationName,
+          i.user.id,
+          targetId,
+          nationName,
+          notes || null,
+          initialMembers,
+        ],
+      );
+      const roomId: number = ins.rows[0].id;
+
+      // Post control embed + ping (embed uses normalized targetUrl)
+      const contentPing = initialMembers.length ? initialMembers.map((x) => `<@${x}>`).join(" ") : "";
+      const emb = controlEmbed({
+        nationName,
+        openerId: i.user.id,
+        targetUrl,
+        notes,
+        members: initialMembers,
+        dossier: null, // filled after create
+      });
+      const msg = await (ch as TextChannel).send({
+        content: contentPing,
+        embeds: [emb],
+        components: [controlButtons(roomId)],
+        allowedMentions: initialMembers.length ? { users: initialMembers } : { parse: [] },
+      });
+      await msg.pin().catch(() => {});
+
+      await query("UPDATE war_rooms SET control_message_id=$1 WHERE id=$2", [msg.id, roomId]);
+
+      // Background: pull dossier and update embed (no blocking, no spam if it fails)
+      tryUpdateDossier(roomId).catch(() => {});
+
+      pendingSetup.delete(key);
+      await i.editReply(`✅ Created <#${ch.id}> — target **${nationName}** (#${targetId}).`);
+      return true;
+    }
+
+    // Add / Remove members
+    if (i.customId.startsWith("war:add:modal:") || i.customId.startsWith("war:remove:modal:")) {
+      const roomId = Number(i.customId.split(":").pop() || 0);
+      const { rows } = await query("SELECT * FROM war_rooms WHERE id=$1", [roomId]);
+      const wr = rows[0];
+      if (!wr) {
+        await i.reply({ ephemeral: true, content: "War Room not found." });
+        return true;
+      }
+
+      const me = await i.guild!.members.fetch(i.user.id);
+      if (!canManage(me, wr.created_by_id)) {
+        await i.reply({ ephemeral: true, content: "You can't manage this War Room." });
+        return true;
+      }
+
+      await i.deferReply({ ephemeral: true });
+
+      const raw = i.fields.getTextInputValue("members") || "";
+      const ids = parseUserTokens(raw);
+
+      const valid: string[] = [];
+      for (const uid of ids) {
+        try {
+          await i.guild!.members.fetch(uid);
+          valid.push(uid);
+        } catch {}
+      }
+      const ch = (await i.client.channels.fetch(wr.channel_id).catch(() => null)) as TextChannel | null;
+      if (!ch) {
+        await i.editReply("Channel not found.");
+        return true;
+      }
+
+      if (i.customId.startsWith("war:add:modal:")) {
+        for (const uid of valid) {
+          await ch.permissionOverwrites.edit(uid, {
+            ViewChannel: true,
+            SendMessages: true,
+            ReadMessageHistory: true,
+          }).catch(() => {});
+        }
+        const merged = Array.from(new Set([...(wr.member_ids || []), ...valid]));
+        await query("UPDATE war_rooms SET member_ids=$1 WHERE id=$2", [merged, roomId]);
+        await refreshControlEmbed(ch, roomId);
+        await i.editReply(`✅ Added ${valid.map((x) => `<@${x}>`).join(" ") || "(none)"}`);
+      } else {
+        for (const uid of valid) {
+          await ch.permissionOverwrites.delete(uid).catch(() => {});
+        }
+        const filtered = (wr.member_ids || []).filter((x: string) => !valid.includes(x));
+        await query("UPDATE war_rooms SET member_ids=$1 WHERE id=$2", [filtered, roomId]);
+        await refreshControlEmbed(ch, roomId);
+        await i.editReply(`🧹 Removed ${valid.map((x) => `<@${x}>`).join(" ") || "(none)"}`);
+      }
+
+      return true;
+    }
+
+    return false;
+  },
+};
+
+export default cmd;
