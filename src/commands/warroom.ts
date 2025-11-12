@@ -29,19 +29,36 @@ type Cmd = {
 const CATEGORY_NAME = process.env.WARROOM_CATEGORY_NAME || "WAR ROOMS";
 const PNW_API_KEY = process.env.PNW_API_KEY || process.env.PNW_DEFAULT_API_KEY || "";
 
-const pendingSetup = new Map<string, { targetId: number; preMembers: string[] }>();
+// cache during setup (keyed by guild:user)
+const pendingSetup = new Map<
+  string,
+  { targetId: number; targetUrl: string; preMembers: string[] }
+>();
 const setupKey = (guildId: string, userId: string) => `${guildId}:${userId}`;
 
-// ---------- Helpers ----------
-function parseTargetId(raw: string): number | null {
-  const m = (raw || "").match(/(\d{1,9})/);
+/* ---------- Helpers ---------- */
+
+function normalizeTarget(raw: string): { id: number; url: string } | null {
+  const s = (raw || "").trim();
+
+  // Prefer explicit id=... first (works for e.g. https://politicsandwar.com/nation/id=246232&foo=bar)
+  let m = s.match(/[?&]id=(\d{1,9})/i) || s.match(/\/id=(\d{1,9})/i);
+  if (!m) {
+    // Fallback: take the LAST 3–9 digit run in the string
+    const all = [...s.matchAll(/(\d{3,9})/g)];
+    if (all.length) m = all[all.length - 1];
+  }
   if (!m) return null;
+
   const id = Number(m[1]);
-  return Number.isFinite(id) && id > 0 ? id : null;
+  if (!Number.isFinite(id) || id <= 0) return null;
+
+  // Canonical nation URL
+  const url = `https://politicsandwar.com/nation/id=${id}`;
+  return { id, url };
 }
 
 async function fetchNationName(id: number): Promise<string | null> {
-  // GraphQL per your stack
   const q = `{ nations(id:${id}){ data{ nation_name } } }`;
   const url = `https://api.politicsandwar.com/graphql?api_key=${encodeURIComponent(PNW_API_KEY)}`;
   try {
@@ -61,12 +78,6 @@ async function fetchNationName(id: number): Promise<string | null> {
 
 function slug(s: string) {
   return s.toLowerCase().replace(/[^a-z0-9-]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 80);
-}
-
-async function ensureMembersInGuild(guildId: string, ids: string[]): Promise<string[]> {
-  const g = await (await import("discord.js")).resolveGuild(guildId).catch(() => null);
-  // resolveGuild is not exported; use client from interaction instead (we get it when we need to)
-  return ids; // fallback (we validate per-interaction below)
 }
 
 function parseUserTokens(input: string): string[] {
@@ -113,21 +124,6 @@ function controlEmbed(opts: {
   return emb;
 }
 
-async function getOrCreateCategory(i: ChatInputCommandInteraction) {
-  const guild = i.guild!;
-  let cat = guild.channels.cache.find(
-    (c) => c.type === ChannelType.GuildCategory && c.name.toUpperCase() === CATEGORY_NAME.toUpperCase(),
-  );
-  if (!cat) {
-    cat = await guild.channels.create({
-      name: CATEGORY_NAME,
-      type: ChannelType.GuildCategory,
-      reason: "War Room category",
-    });
-  }
-  return cat;
-}
-
 function canManage(member: GuildMember, creatorId: string) {
   return member.id === creatorId || member.permissions.has(PermissionFlagsBits.ManageChannels);
 }
@@ -151,7 +147,8 @@ async function refreshControlEmbed(ch: TextChannel, roomId: number) {
   await msg.edit({ embeds: [emb], components: [controlButtons(roomId)] }).catch(() => {});
 }
 
-// ---------- Command ----------
+/* ---------- Command ---------- */
+
 const cmd: Cmd = {
   data: new SlashCommandBuilder()
     .setName("warroom")
@@ -168,22 +165,26 @@ const cmd: Cmd = {
       }
       return b;
     }),
+
   async execute(i: ChatInputCommandInteraction) {
     if (!i.inGuild() || !i.guildId) {
       await i.reply({ content: "Run this in a server.", ephemeral: true });
       return;
     }
-
-    if (i.options.getSubcommand() !== "setup") return;
-
-    const raw = i.options.getString("target", true);
-    const id = parseTargetId(raw);
-    if (!id) {
-      await i.reply({ content: "Invalid target. Provide a nation ID or a nation URL.", ephemeral: true });
+    const sub = i.options.getSubcommand(false);
+    if (sub !== "setup") {
+      await i.reply({ ephemeral: true, content: "Use **/warroom setup**." });
       return;
     }
 
-    // Pre-gather up to 10 member IDs (we validate existence later)
+    const raw = i.options.getString("target", true);
+    const norm = normalizeTarget(raw);
+    if (!norm) {
+      await i.reply({ content: "Invalid target. Provide a nation ID or a valid nation URL.", ephemeral: true });
+      return;
+    }
+
+    // Pre-gather up to 10 member IDs
     const pre: string[] = [];
     for (let idx = 1; idx <= 10; idx++) {
       const u = i.options.getUser(`member${idx}`, false);
@@ -192,22 +193,37 @@ const cmd: Cmd = {
     const preUnique = Array.from(new Set(pre));
 
     // Stash for modal submit (keyed by guild:user)
-    pendingSetup.set(setupKey(i.guildId, i.user.id), { targetId: id, preMembers: preUnique });
+    pendingSetup.set(setupKey(i.guildId, i.user.id), {
+      targetId: norm.id,
+      targetUrl: norm.url,
+      preMembers: preUnique,
+    });
 
-    // Modal: Notes only
-    const modal = new ModalBuilder().setCustomId("war:setup").setTitle("War Room Notes");
+    // Modal: Notes + read-only-ish Target URL (filled; we ignore edits)
+    const modal = new ModalBuilder().setCustomId("war:setup").setTitle("War Room — Confirm Details");
+
     const notes = new TextInputBuilder()
       .setCustomId("notes")
       .setLabel("Notes (visible to everyone)")
       .setStyle(TextInputStyle.Paragraph)
       .setRequired(false)
       .setMaxLength(1024);
-    modal.addComponents(new ActionRowBuilder<TextInputBuilder>().addComponents(notes));
+
+    const urlPreview = new TextInputBuilder()
+      .setCustomId("target_url_preview")
+      .setLabel("Target URL (for reference)")
+      .setStyle(TextInputStyle.Short)
+      .setRequired(false)
+      .setValue(norm.url.slice(0, 100)); // Discord limit is 100 for short inputs
+
+    modal.addComponents(
+      new ActionRowBuilder<TextInputBuilder>().addComponents(urlPreview),
+      new ActionRowBuilder<TextInputBuilder>().addComponents(notes),
+    );
 
     await i.showModal(modal);
   },
 
-  // Handle buttons: add/remove/close
   async handleButton(i: ButtonInteraction): Promise<boolean> {
     const cid = i.customId || "";
     if (!cid.startsWith("war:")) return false;
@@ -258,7 +274,6 @@ const cmd: Cmd = {
     return true;
   },
 
-  // Handle modals: setup / add / remove
   async handleModal(i: ModalSubmitInteraction): Promise<boolean> {
     if (!i.inGuild() || !i.guildId) return false;
 
@@ -273,25 +288,21 @@ const cmd: Cmd = {
 
       await i.deferReply({ ephemeral: true });
 
-      const targetId = cached.targetId;
-      const nationName = await fetchNationName(targetId);
-      if (!nationName) {
-        await i.editReply("Could not resolve nation name from PnW API. Try again.");
-        pendingSetup.delete(key);
-        return true;
-      }
+      const { targetId, targetUrl, preMembers } = cached;
 
-      // Normalize members: ensure they exist in guild
-      const pre: string[] = [];
-      for (const uid of cached.preMembers) {
+      // Resolve nation name (fallback to #ID if API fails)
+      const nationName = (await fetchNationName(targetId)) ?? `Nation #${targetId}`;
+
+      // Validate members exist in guild
+      const initialMembers: string[] = [];
+      for (const uid of preMembers) {
         try {
           await i.guild!.members.fetch(uid);
-          pre.push(uid);
+          initialMembers.push(uid);
         } catch {}
       }
-      const initialMembers = Array.from(new Set(pre));
 
-      // Ensure category
+      // Ensure/locate category
       let cat = i.guild!.channels.cache.find(
         (c) => c.type === ChannelType.GuildCategory && c.name.toUpperCase() === CATEGORY_NAME.toUpperCase(),
       );
@@ -320,7 +331,6 @@ const cmd: Cmd = {
       });
 
       const notes = i.fields.getTextInputValue("notes")?.trim() || "";
-      const targetUrl = `https://politicsandwar.com/nation/id=${targetId}`;
 
       // Insert DB row
       const ins = await query(
@@ -343,7 +353,7 @@ const cmd: Cmd = {
       );
       const roomId: number = ins.rows[0].id;
 
-      // Post control embed + ping
+      // Post control embed + ping (embed uses normalized targetUrl)
       const contentPing = initialMembers.length ? initialMembers.map((x) => `<@${x}>`).join(" ") : "";
       const emb = controlEmbed({
         nationName,
