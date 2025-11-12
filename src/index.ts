@@ -10,6 +10,7 @@ import {
   Interaction,
   MessageFlags,
 } from "discord.js";
+import type { ButtonInteraction, ModalSubmitInteraction } from "discord.js";
 import fs from "node:fs";
 import path from "node:path";
 import { createRequire } from "node:module";
@@ -56,6 +57,15 @@ function loadCommands() {
         console.warn(`Skipping ${file}: no valid default export`);
         continue;
       }
+      // Optional component handlers (buttons/modals) supported if present
+      // @ts-expect-error - extra fields are allowed at runtime
+      if (typeof mod.default.handleButton === "function") {
+        // ok
+      }
+      // @ts-expect-error - extra fields are allowed at runtime
+      if (typeof mod.default.handleModal === "function") {
+        // ok
+      }
       commands.set(cmd.data.name, cmd);
     } catch (e) {
       console.error(`Failed loading command ${file}:`, e);
@@ -63,6 +73,48 @@ function loadCommands() {
   }
 
   console.log(`Loaded ${commands.size} command(s).`);
+}
+
+// Helper: delegate a button to any command that exports handleButton(interaction)
+async function delegateButton(interaction: ButtonInteraction): Promise<boolean> {
+  for (const cmd of commands.values()) {
+    // @ts-expect-error - runtime optional handler
+    const handler = (cmd as any).handleButton;
+    if (typeof handler === "function") {
+      try {
+        const before = { replied: interaction.replied, deferred: interaction.deferred };
+        const res = await handler(interaction);
+        if (res === true) return true;
+        if (interaction.replied !== before.replied || interaction.deferred !== before.deferred) {
+          return true;
+        }
+      } catch (err) {
+        console.error(`[delegateButton] handler error for ${cmd.data?.name}:`, err);
+      }
+    }
+  }
+  return false;
+}
+
+// Helper: delegate a modal to any command that exports handleModal(interaction)
+async function delegateModal(interaction: ModalSubmitInteraction): Promise<boolean> {
+  for (const cmd of commands.values()) {
+    // @ts-expect-error - runtime optional handler
+    const handler = (cmd as any).handleModal;
+    if (typeof handler === "function") {
+      try {
+        const before = { replied: interaction.replied, deferred: interaction.deferred };
+        const res = await handler(interaction);
+        if (res === true) return true;
+        if (interaction.replied !== before.replied || interaction.deferred !== before.deferred) {
+          return true;
+        }
+      } catch (err) {
+        console.error(`[delegateModal] handler error for ${cmd.data?.name}:`, err);
+      }
+    }
+  }
+  return false;
 }
 
 // Fired when bot is ready
@@ -138,6 +190,18 @@ client.on("interactionCreate", async (interaction: Interaction) => {
         }
         return;
       }
+
+      // Delegate any other buttons (e.g., warroom controls) to command modules
+      const handled = await delegateButton(interaction);
+      if (handled) return;
+    }
+
+    // Modal submissions (e.g., warroom setup/add/remove)
+    if (interaction.isModalSubmit()) {
+      const handled = await delegateModal(interaction);
+      if (handled) return;
+      // If unhandled, stay silent to avoid noise
+      return;
     }
   } catch (e) {
     console.error("interaction error:", e);
