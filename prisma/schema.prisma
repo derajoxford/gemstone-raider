@@ -1,0 +1,24 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model WarRoom {
+  id               Int       @id @default(autoincrement())
+  guildId          String
+  channelId        String    @unique
+  controlMessageId String?
+  name             String    // nation name (required)
+  createdById      String
+  targetNationId   Int
+  targetNationName String
+  notes            String?
+  memberIds        String[]  // explicit user grants (no roles)
+  createdAt        DateTime  @default(now())
+
+  @@index([guildId])
+}
