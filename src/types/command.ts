@@ -1,20 +1,20 @@
 // src/types/command.ts
-import type {
+import {
+  ButtonInteraction,
+  ChatInputCommandInteraction,
+  ModalSubmitInteraction,
   SlashCommandBuilder,
   SlashCommandSubcommandsOnlyBuilder,
-  ChatInputCommandInteraction,
-  ButtonInteraction,
-  ModalSubmitInteraction,
 } from "discord.js";
 
 export type Command = {
-  // Accept either plain builder or the subcommands-only builder
   data: SlashCommandBuilder | SlashCommandSubcommandsOnlyBuilder;
+  execute: (interaction: ChatInputCommandInteraction) => Promise<any>;
 
-  // Required: slash command entry
-  execute(i: ChatInputCommandInteraction): Promise<void>;
+  // Optional routers used by some commands
+  handleModal?: (interaction: ModalSubmitInteraction) => Promise<any>;
+  handleButton?: (i: ButtonInteraction) => Promise<boolean>;
 
-  // Optional: component handlers
-  handleButton?(i: ButtonInteraction): Promise<boolean>;
-  handleModal?(i: ModalSubmitInteraction): Promise<boolean>;
+  // Registry supports disabled flag; keep type happy
+  disabled?: boolean;
 };
