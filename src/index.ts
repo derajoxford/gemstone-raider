@@ -27,7 +27,6 @@ if (!token || !appId) {
 
 const client = new Client({ intents: [GatewayIntentBits.Guilds] });
 
-// name -> command impl
 const commands = new Collection<string, Command>();
 
 function loadCommands() {
@@ -42,8 +41,8 @@ function loadCommands() {
       const mod = require(path.join(commandsPath, file));
       const cmd: Command = mod.default;
       if (!cmd?.data || typeof cmd.execute !== "function") continue;
-      // registry honors optional disabled
-      // @ts-ignore - at runtime it's fine
+      // honor optional disabled flag
+      // @ts-ignore runtime check only
       if (cmd.disabled) continue;
       commands.set(cmd.data.name, cmd);
     } catch (e) {
@@ -69,7 +68,6 @@ client.once("ready", async () => {
 
 client.on("interactionCreate", async (interaction: Interaction) => {
   try {
-    // Slash commands
     if (interaction.isChatInputCommand()) {
       const command = commands.get(interaction.commandName);
       if (!command) return;
@@ -77,7 +75,6 @@ client.on("interactionCreate", async (interaction: Interaction) => {
       return;
     }
 
-    // Modals — let any command that cares handle it
     if (interaction.isModalSubmit()) {
       for (const cmd of commands.values()) {
         if (typeof cmd.handleModal === "function") {
@@ -87,10 +84,10 @@ client.on("interactionCreate", async (interaction: Interaction) => {
       return;
     }
 
-    // Buttons: first, watcher toggles
     if (interaction.isButton()) {
       const cid = interaction.customId || "";
 
+      // Built-in watch toggles (project has these)
       if (cid.startsWith("watch:toggle:")) {
         const nationId = Number(cid.split(":")[2] || 0);
         if (!Number.isFinite(nationId) || nationId <= 0) {
@@ -130,13 +127,13 @@ client.on("interactionCreate", async (interaction: Interaction) => {
         return;
       }
 
-      // Delegate to commands that implement handleButton
+      // Delegate to commands
       for (const cmd of commands.values()) {
         if (typeof cmd.handleButton === "function") {
           try {
             const handled = await cmd.handleButton(interaction);
             if (handled) return;
-          } catch (e) {
+          } catch {
             // let other handlers try
           }
         }
