@@ -1,6 +1,4 @@
 // src/pnw/wars.ts
-// Fetch ACTIVE wars (offense + defense) via GraphQL (modern schema)
-
 const GQL =
   (process.env.PNW_API_BASE_GRAPHQL ||
     "https://api.politicsandwar.com/graphql").trim();
@@ -16,12 +14,18 @@ export type WarRecord = {
   date: string | null;
   turns_left: number | null;
   reason: string | null;
-
   attacker_id: number;
   defender_id: number;
+  attacker?: { nation_name: string | null } | null;
+  defender?: { nation_name: string | null } | null;
+};
 
-  attacker?: { nation_name: string | null };
-  defender?: { nation_name: string | null };
+type GqlWarsResp = {
+  data?: {
+    offense?: { data?: WarRecord[] };
+    defense?: { data?: WarRecord[] };
+  };
+  errors?: any;
 };
 
 export async function fetchActiveWars(
@@ -33,26 +37,14 @@ export async function fetchActiveWars(
     query ActiveWars($id: ID!) {
       offense: wars(first: 25, attacker_id: $id) {
         data {
-          id
-          war_type
-          date
-          turns_left
-          reason
-          attacker_id
-          defender_id
+          id war_type date turns_left reason attacker_id defender_id
           attacker { nation_name }
           defender { nation_name }
         }
       }
       defense: wars(first: 25, defender_id: $id) {
         data {
-          id
-          war_type
-          date
-          turns_left
-          reason
-          attacker_id
-          defender_id
+          id war_type date turns_left reason attacker_id defender_id
           attacker { nation_name }
           defender { nation_name }
         }
@@ -60,27 +52,21 @@ export async function fetchActiveWars(
     }
   `;
 
-  const body = {
-    query,
-    variables: { id: nationId },
-  };
-
   try {
     const res = await fetch(`${GQL}?api_key=${encodeURIComponent(KEY)}`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(body),
+      body: JSON.stringify({ query, variables: { id: nationId } }),
     });
-
     if (!res.ok) return { offense: [], defense: [] };
-    const json: any = await res.json();
+    const json = (await res.json()) as GqlWarsResp;
     if (json.errors) return { offense: [], defense: [] };
 
-    const offense: WarRecord[] = (json.data?.offense?.data ?? []).filter(
-      (w: any) => w.turns_left && w.turns_left > 0,
+    const offense = (json.data?.offense?.data ?? []).filter(
+      (w) => (w.turns_left ?? 0) > 0,
     );
-    const defense: WarRecord[] = (json.data?.defense?.data ?? []).filter(
-      (w: any) => w.turns_left && w.turns_left > 0,
+    const defense = (json.data?.defense?.data ?? []).filter(
+      (w) => (w.turns_left ?? 0) > 0,
     );
 
     return { offense, defense };
