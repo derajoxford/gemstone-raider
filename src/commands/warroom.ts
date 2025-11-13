@@ -138,8 +138,10 @@ function ago(iso?: string | null): string {
   return `${m}m ${s}s ago`;
 }
 
-// ---------- wars block (W1 minimal) ----------
+// ---------- wars block (W1 minimal + slots) ----------
 function formatWarsBlock(offense: WarRecord[], defense: WarRecord[]): string {
+  const slotLine = `🎯 **Slots:** O ${offense.length}/3 • D ${defense.length}/3`;
+
   const fmtOff = (w: WarRecord) => {
     const enemy = w.defender?.nation_name || `#${w.defender_id}`;
     const started = ago(w.date);
@@ -164,7 +166,9 @@ function formatWarsBlock(offense: WarRecord[], defense: WarRecord[]): string {
   const oBlock = offense.length ? offense.map(fmtOff).join("\n\n") : "*None*";
   const dBlock = defense.length ? defense.map(fmtDef).join("\n\n") : "*None*";
 
-  return [`🗡️ **Offense**`, oBlock, "", `🛡️ **Defense**`, dBlock].join("\n");
+  return [slotLine, "", `🗡️ **Offense**`, oBlock, "", `🛡️ **Defense**`, dBlock].join(
+    "\n",
+  );
 }
 
 // ---------- dossier block ----------
@@ -574,6 +578,9 @@ async function handleClose(interaction: ButtonInteraction) {
   const row = await requireRoomFromButton(interaction);
   if (!row) return true;
 
+  // Acknowledge first to avoid "Unknown Channel" if deletion succeeds
+  await interaction.reply({ content: "🔒 Closing…", ephemeral: true });
+
   const guild = interaction.guild!;
   const chan = await guild.channels.fetch(row.channel_id).catch(() => null);
 
@@ -583,7 +590,6 @@ async function handleClose(interaction: ButtonInteraction) {
   }
 
   await query(`DELETE FROM war_rooms WHERE id=$1`, [row.id]);
-  await interaction.reply({ content: "Closed.", ephemeral: true });
   return true;
 }
 
@@ -596,10 +602,7 @@ const command: Command = {
         .setName("setup")
         .setDescription("Create a new war room")
         .addStringOption((o) =>
-          o
-            .setName("target")
-            .setDescription("Nation ID or URL")
-            .setRequired(true),
+          o.setName("target").setDescription("Nation ID or URL").setRequired(true),
         )
         .addUserOption((o) => o.setName("member1").setDescription("Member"))
         .addUserOption((o) => o.setName("member2").setDescription("Member"))
@@ -630,4 +633,3 @@ const command: Command = {
 };
 
 export default command;
-
