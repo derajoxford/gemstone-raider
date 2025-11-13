@@ -1,4 +1,5 @@
 // src/commands/warroom.ts
+
 import {
   ActionRowBuilder,
   ButtonBuilder,
@@ -16,14 +17,9 @@ import {
 } from "discord.js";
 import { query } from "../data/db.js";
 
-// --- Types ------------------------------------------------------------
+type Command = import("../types/command.js").Command;
 
-type Cmd = {
-  data: SlashCommandBuilder | SlashCommandSubcommandsOnlyBuilder;
-  execute: (interaction: ChatInputCommandInteraction) => Promise<void>;
-  handleModal?: (interaction: any) => Promise<void>;
-  handleButton?: (interaction: ButtonInteraction) => Promise<void>;
-};
+// ---- DB row type -----------------------------------------------------
 
 type WarRoomRow = {
   id: string;
@@ -39,6 +35,8 @@ type WarRoomRow = {
   created_at: Date;
 };
 
+// ---- Dossier type ----------------------------------------------------
+
 type DossierInfo = {
   score?: number;
   cities?: number;
@@ -52,12 +50,12 @@ type DossierInfo = {
   allianceName?: string;
 };
 
-// --- Helpers ---------------------------------------------------------
+// ---- Target parsing helpers ------------------------------------------
 
 function parseNationTarget(raw: string): { id: number; url: string } | null {
   raw = raw.trim();
 
-  // handle nation URL: https://politicsandwar.com/nation/id=12345
+  // handle full URL: https://politicsandwar.com/nation/id=12345
   const urlMatch = raw.match(/nation\/id=(\d+)/i);
   if (urlMatch) {
     const id = Number(urlMatch[1]);
@@ -85,6 +83,8 @@ function nationLink(id: number, name: string | null): string {
   const safeName = name && name.trim().length > 0 ? name.trim() : `Nation #${id}`;
   return `[${safeName}](https://politicsandwar.com/nation/id=${id})`;
 }
+
+// ---- Nation lookups (name + dossier) ---------------------------------
 
 async function fetchNationNameViaGraphQL(nationId: number): Promise<string | null> {
   const base =
@@ -128,7 +128,7 @@ async function fetchNationNameViaGraphQL(nationId: number): Promise<string | nul
 }
 
 // Use REST Nation API for dossier-style stats.
-// baseurl/nation/id={nation id}/&key={api key}
+//   baseurl/nation/id={nation id}/&key={api key}
 async function fetchNationDossier(nationId: number): Promise<DossierInfo | null> {
   const base =
     (process.env.PNW_API_BASE_REST || "https://politicsandwar.com/api").trim();
@@ -141,7 +141,9 @@ async function fetchNationDossier(nationId: number): Promise<DossierInfo | null>
   if (!key) return null;
 
   const url =
-    `${base.replace(/\/+$/, "")}/nation/id=${nationId}/&key=${encodeURIComponent(key)}`;
+    `${base.replace(/\/+$/, "")}/nation/id=${nationId}/&key=${encodeURIComponent(
+      key,
+    )}`;
 
   try {
     const res = await fetch(url, {
@@ -160,36 +162,59 @@ async function fetchNationDossier(nationId: number): Promise<DossierInfo | null>
       return null;
     }
 
-    // Field names from Nation API (deprecated but still live).
-    const score = data.score !== undefined ? Number(data.score) : undefined;
-    const cities = data.cities !== undefined ? Number(data.cities) : undefined;
-    const soldiers = data.soldiers !== undefined ? Number(data.soldiers) : undefined;
-    const tanks = data.tanks !== undefined ? Number(data.tanks) : undefined;
+    const score =
+      data.score !== undefined && Number.isFinite(Number(data.score))
+        ? Number(data.score)
+        : undefined;
+    const cities =
+      data.cities !== undefined && Number.isFinite(Number(data.cities))
+        ? Number(data.cities)
+        : undefined;
+    const soldiers =
+      data.soldiers !== undefined && Number.isFinite(Number(data.soldiers))
+        ? Number(data.soldiers)
+        : undefined;
+    const tanks =
+      data.tanks !== undefined && Number.isFinite(Number(data.tanks))
+        ? Number(data.tanks)
+        : undefined;
     const aircraft =
-      data.aircraft !== undefined ? Number(data.aircraft) : undefined;
-    const ships = data.ships !== undefined ? Number(data.ships) : undefined;
+      data.aircraft !== undefined && Number.isFinite(Number(data.aircraft))
+        ? Number(data.aircraft)
+        : undefined;
+    const ships =
+      data.ships !== undefined && Number.isFinite(Number(data.ships))
+        ? Number(data.ships)
+        : undefined;
     const missiles =
-      data.missiles !== undefined ? Number(data.missiles) : undefined;
-    const nukes = data.nukes !== undefined ? Number(data.nukes) : undefined;
-    const beigeTurnsRaw =
+      data.missiles !== undefined && Number.isFinite(Number(data.missiles))
+        ? Number(data.missiles)
+        : undefined;
+    const nukes =
+      data.nukes !== undefined && Number.isFinite(Number(data.nukes))
+        ? Number(data.nukes)
+        : undefined;
+    const beigeRaw =
       data.beige_turns_left ?? data.beige_turns ?? data.beige_turns_left;
     const beigeTurns =
-      beigeTurnsRaw !== undefined ? Number(beigeTurnsRaw) : undefined;
+      beigeRaw !== undefined && Number.isFinite(Number(beigeRaw))
+        ? Number(beigeRaw)
+        : undefined;
     const allianceName =
       typeof data.alliance === "string" && data.alliance !== "0"
         ? data.alliance
         : undefined;
 
     return {
-      score: Number.isFinite(score) ? score : undefined,
-      cities: Number.isFinite(cities) ? cities : undefined,
-      soldiers: Number.isFinite(soldiers) ? soldiers : undefined,
-      tanks: Number.isFinite(tanks) ? tanks : undefined,
-      aircraft: Number.isFinite(aircraft) ? aircraft : undefined,
-      ships: Number.isFinite(ships) ? ships : undefined,
-      missiles: Number.isFinite(missiles) ? missiles : undefined,
-      nukes: Number.isFinite(nukes) ? nukes : undefined,
-      beigeTurns: Number.isFinite(beigeTurns) ? beigeTurns : undefined,
+      score,
+      cities,
+      soldiers,
+      tanks,
+      aircraft,
+      ships,
+      missiles,
+      nukes,
+      beigeTurns,
       allianceName,
     };
   } catch (err) {
@@ -197,6 +222,8 @@ async function fetchNationDossier(nationId: number): Promise<DossierInfo | null>
     return null;
   }
 }
+
+// ---- Dossier block formatting ----------------------------------------
 
 function formatDossierBlock(d: DossierInfo | null): string {
   if (!d) {
@@ -206,7 +233,7 @@ function formatDossierBlock(d: DossierInfo | null): string {
   const lines: string[] = [];
 
   if (d.allianceName) {
-    lines.push(`👥 **AA:** ${d.allianceName}`);
+    lines.push(`🧑‍🤝‍🧑 **AA:** ${d.allianceName}`);
   }
   if (d.score !== undefined) {
     lines.push(`📈 **Score:** ${d.score.toFixed(2)}`);
@@ -215,20 +242,21 @@ function formatDossierBlock(d: DossierInfo | null): string {
     lines.push(`🏙️ **Cities:** ${d.cities}`);
   }
 
-  const milBits: string[] = [];
-  if (d.soldiers !== undefined) milBits.push(`🪖 ${d.soldiers.toLocaleString()}`);
-  if (d.tanks !== undefined) milBits.push(`🛡️ ${d.tanks.toLocaleString()}`);
-  if (d.aircraft !== undefined) milBits.push(`✈️ ${d.aircraft.toLocaleString()}`);
-  if (d.ships !== undefined) milBits.push(`🚢 ${d.ships.toLocaleString()}`);
-  if (milBits.length) {
-    lines.push(`⚔️ **Mil:** ${milBits.join(" • ")}`);
+  const mil: string[] = [];
+  if (d.soldiers !== undefined) mil.push(`🪖 ${d.soldiers.toLocaleString()}`);
+  if (d.tanks !== undefined) mil.push(`🛡️ ${d.tanks.toLocaleString()}`);
+  if (d.aircraft !== undefined)
+    mil.push(`✈️ ${d.aircraft.toLocaleString()}`);
+  if (d.ships !== undefined) mil.push(`🚢 ${d.ships.toLocaleString()}`);
+  if (mil.length) {
+    lines.push(`⚔️ **Mil:** ${mil.join(" • ")}`);
   }
 
-  const boomBits: string[] = [];
-  if (d.missiles !== undefined) boomBits.push(`🎯 ${d.missiles}`);
-  if (d.nukes !== undefined) boomBits.push(`☢️ ${d.nukes}`);
-  if (boomBits.length) {
-    lines.push(`💣 **Strategic:** ${boomBits.join(" • ")}`);
+  const boom: string[] = [];
+  if (d.missiles !== undefined) boom.push(`🎯 ${d.missiles}`);
+  if (d.nukes !== undefined) boom.push(`☢️ ${d.nukes}`);
+  if (boom.length) {
+    lines.push(`💣 **Strategic:** ${boom.join(" • ")}`);
   }
 
   if (d.beigeTurns !== undefined) {
@@ -241,12 +269,14 @@ function formatDossierBlock(d: DossierInfo | null): string {
   return lines.join("\n");
 }
 
+// ---- Embed + controls ------------------------------------------------
+
 function buildControlEmbed(
   row: WarRoomRow,
   creator: User,
   dossier: DossierInfo | null,
 ): EmbedBuilder {
-  const memberMentions =
+  const members =
     row.member_ids && row.member_ids.length
       ? row.member_ids.map((id) => `<@${id}>`).join("\n")
       : "*none*";
@@ -260,7 +290,7 @@ function buildControlEmbed(
         `👤 **Created by:** <@${row.created_by_id}>`,
         "",
         "👥 **Members**",
-        memberMentions,
+        members,
         "",
         "📝 **Notes**",
         row.notes && row.notes.trim().length ? row.notes.trim() : "*none*",
@@ -298,7 +328,7 @@ function buildControlRow() {
   );
 }
 
-// DB helpers ----------------------------------------------------------
+// ---- DB helpers ------------------------------------------------------
 
 async function insertWarRoom(row: {
   guildId: string;
@@ -362,7 +392,7 @@ async function updateWarRoomControlMessage(
   ]);
 }
 
-// --- Command implementation ------------------------------------------
+// ---- /warroom setup --------------------------------------------------
 
 async function handleSetup(interaction: ChatInputCommandInteraction) {
   const guild = interaction.guild;
@@ -426,6 +456,8 @@ async function handleSetup(interaction: ChatInputCommandInteraction) {
   await interaction.showModal(modal);
 }
 
+// ---- modal: create channel under WAR ROOMS category ------------------
+
 async function handleSetupModal(interaction: any) {
   if (!interaction.isModalSubmit()) return;
   const { guild, user } = interaction;
@@ -437,8 +469,7 @@ async function handleSetupModal(interaction: any) {
     return;
   }
 
-  const [prefix, kind, nidStr, membersStr] =
-    interaction.customId.split(":");
+  const [prefix, kind, nidStr, membersStr] = interaction.customId.split(":");
   if (prefix !== "warroom" || kind !== "setup") return;
 
   const nationId = Number(nidStr);
@@ -480,28 +511,46 @@ async function handleSetupModal(interaction: any) {
     .replace(/^-+|-+$/g, "");
   const channelName = `war-${slugBase || parsed.id}`;
 
-  const parent = (interaction.channel && "parent" in interaction.channel)
-    ? (interaction.channel as any).parent
-    : null;
+  // ALWAYS use a dedicated category
+  const categoryName =
+    process.env.WARROOM_CATEGORY_NAME || "WAR ROOMS";
 
-  const channel = await guild.channels.create({
+  let warCat: any =
+    guild.channels.cache.find(
+      (c: any) =>
+        c.type === 4 && // GuildCategory
+        typeof c.name === "string" &&
+        c.name.toLowerCase() === categoryName.toLowerCase(),
+    ) || null;
+
+  if (!warCat) {
+    warCat = await (guild.channels as any).create({
+      name: categoryName,
+      type: 4, // GuildCategory
+      reason: "Gemstone Raider — War Rooms category",
+    } as any);
+  }
+
+  const channel: any = await (guild.channels as any).create({
     name: channelName,
-    parent: parent ?? undefined,
+    parent: warCat.id,
     topic: `War room for ${targetName} (#${parsed.id})`,
-  });
+    reason: `War room created by ${user.tag}`,
+  } as any);
 
   const uniqueMemberIds = Array.from(
     new Set<string>([user.id, ...memberIds]),
   );
 
-  if (channel.isTextBased() && "permissionOverwrites" in channel) {
-    // allow members to see & talk; leave admin perms alone
+  if (channel && channel.permissionOverwrites) {
     for (const mid of uniqueMemberIds) {
-      await channel.permissionOverwrites.edit(mid, {
-        ViewChannel: true,
-        SendMessages: true,
-        ReadMessageHistory: true,
-      } as any);
+      await channel.permissionOverwrites
+        .edit(mid, {
+          ViewChannel: true,
+          SendMessages: true,
+          ReadMessageHistory: true,
+        } as any)
+        .catch(() => {});
     }
   }
 
@@ -522,10 +571,10 @@ async function handleSetupModal(interaction: any) {
   };
 
   const embed = buildControlEmbed(row, user, dossier);
-  const controlMsg = await (channel as any).send({
+  const controlMsg = await channel.send({
     content:
       uniqueMemberIds.length > 0
-        ? uniqueMemberIds.map((id) => `<@${id}>`).join(" ")
+        ? uniqueMemberIds.map((id: string) => `<@${id}>`).join(" ")
         : undefined,
     embeds: [embed],
     components: [buildControlRow()],
@@ -546,9 +595,116 @@ async function handleSetupModal(interaction: any) {
   });
 
   await interaction.editReply({
-    content: `✅ War room created: ${channel}`,
+    content: `✅ War room created: <#${channel.id}>`,
   });
 }
+
+// ---- member add/remove modal helpers ---------------------------------
+
+function parseUserFromModalField(
+  raw: string,
+  guildUsers: Map<string, User>,
+): string | null {
+  raw = raw.trim();
+  const mentionMatch = raw.match(/^<@!?(\d+)>$/);
+  if (mentionMatch) return mentionMatch[1];
+  if (/^\d{5,}$/.test(raw)) return raw;
+  for (const [id, u] of guildUsers.entries()) {
+    if (u.username.toLowerCase() === raw.toLowerCase()) return id;
+  }
+  return null;
+}
+
+async function handleMemberModal(interaction: any) {
+  if (!interaction.isModalSubmit()) return;
+  const [prefix, kind, id] = interaction.customId.split(":");
+  if (prefix !== "warroom") return;
+  if (kind !== "addMember" && kind !== "removeMember") return;
+
+  const { guild } = interaction;
+  if (!guild) {
+    await interaction.reply({
+      content: "Guild missing.",
+      ephemeral: true,
+    });
+    return;
+  }
+
+  const { rows } = await query<WarRoomRow>(
+    `SELECT * FROM war_rooms WHERE id=$1 LIMIT 1`,
+    [id],
+  );
+  const row = rows[0];
+  if (!row) {
+    await interaction.reply({
+      content: "War room record not found.",
+      ephemeral: true,
+    });
+    return;
+  }
+
+  const rawUser = interaction.fields.getTextInputValue("user");
+  const cache = new Map<string, User>();
+  for (const m of guild.members.cache.values()) {
+    cache.set(m.id, m.user);
+  }
+
+  const userId = parseUserFromModalField(rawUser, cache);
+  if (!userId) {
+    await interaction.reply({
+      content: "Could not parse that user. Use an ID or a proper mention.",
+      ephemeral: true,
+    });
+    return;
+  }
+
+  const members = new Set<string>(row.member_ids || []);
+
+  if (kind === "addMember") {
+    members.add(userId);
+    try {
+      const chan = await guild.channels.fetch(row.channel_id);
+      if (chan && (chan as any).permissionOverwrites) {
+        await (chan as any).permissionOverwrites.edit(userId, {
+          ViewChannel: true,
+          SendMessages: true,
+          ReadMessageHistory: true,
+        } as any);
+      }
+    } catch {}
+    await updateWarRoomMembers(row.id, Array.from(members));
+    await interaction.reply({
+      content: `✅ Added <@${userId}> to this war room.`,
+      ephemeral: true,
+    });
+  } else {
+    if (!members.has(userId)) {
+      await interaction.reply({
+        content: `That user is not in this war room.`,
+        ephemeral: true,
+      });
+      return;
+    }
+    members.delete(userId);
+    try {
+      const chan = await guild.channels.fetch(row.channel_id);
+      if (chan && (chan as any).permissionOverwrites) {
+        await (chan as any).permissionOverwrites.edit(userId, {
+          ViewChannel: false,
+          SendMessages: false,
+          ReadMessageHistory: false,
+        } as any);
+      }
+    } catch {}
+    await updateWarRoomMembers(row.id, Array.from(members));
+    await interaction.reply({
+      content: `✅ Removed <@${userId}> from this war room.`,
+      ephemeral: true,
+    });
+  }
+}
+
+// ---- button helpers --------------------------------------------------
 
 async function requireWarRoomFromButton(
   interaction: ButtonInteraction,
@@ -616,106 +772,6 @@ async function handleRemoveMember(interaction: ButtonInteraction) {
   await interaction.showModal(modal);
 }
 
-function parseUserFromModalField(raw: string, guildUsers: Map<string, User>): string | null {
-  raw = raw.trim();
-  const mentionMatch = raw.match(/^<@!?(\d+)>$/);
-  if (mentionMatch) return mentionMatch[1];
-  if (/^\d{5,}$/.test(raw)) return raw;
-  for (const [id, u] of guildUsers.entries()) {
-    if (u.username.toLowerCase() === raw.toLowerCase()) return id;
-  }
-  return null;
-}
-
-async function handleMemberModal(interaction: any) {
-  if (!interaction.isModalSubmit()) return;
-  const [prefix, kind, id] = interaction.customId.split(":");
-  if (prefix !== "warroom") return;
-  if (kind !== "addMember" && kind !== "removeMember") return;
-
-  const { guild } = interaction;
-  if (!guild) {
-    await interaction.reply({
-      content: "Guild missing.",
-      ephemeral: true,
-    });
-    return;
-  }
-
-  const { rows } = await query<WarRoomRow>(
-    `SELECT * FROM war_rooms WHERE id=$1 LIMIT 1`,
-    [id],
-  );
-  const row = rows[0];
-  if (!row) {
-    await interaction.reply({
-      content: "War room record not found.",
-      ephemeral: true,
-    });
-    return;
-  }
-
-  const rawUser = interaction.fields.getTextInputValue("user");
-  const cache = new Map<string, User>();
-  for (const m of guild.members.cache.values()) {
-    cache.set(m.id, m.user);
-  }
-
-  const userId = parseUserFromModalField(rawUser, cache);
-  if (!userId) {
-    await interaction.reply({
-      content: "Could not parse that user. Use an ID or a proper mention.",
-      ephemeral: true,
-    });
-    return;
-  }
-
-  const members = new Set<string>(row.member_ids || []);
-
-  if (kind === "addMember") {
-    members.add(userId);
-    try {
-      const chan = await guild.channels.fetch(row.channel_id);
-      if (chan && chan.isTextBased() && "permissionOverwrites" in chan) {
-        await (chan as any).permissionOverwrites.edit(userId, {
-          ViewChannel: true,
-          SendMessages: true,
-          ReadMessageHistory: true,
-        } as any);
-      }
-    } catch {}
-    await updateWarRoomMembers(row.id, Array.from(members));
-    await interaction.reply({
-      content: `✅ Added <@${userId}> to this war room.`,
-      ephemeral: true,
-    });
-  } else {
-    if (!members.has(userId)) {
-      await interaction.reply({
-        content: `That user is not in this war room.`,
-        ephemeral: true,
-      });
-      return;
-    }
-    members.delete(userId);
-    try {
-      const chan = await guild.channels.fetch(row.channel_id);
-      if (chan && chan.isTextBased() && "permissionOverwrites" in chan) {
-        await (chan as any).permissionOverwrites.edit(userId, {
-          ViewChannel: false,
-          SendMessages: false,
-          ReadMessageHistory: false,
-        } as any);
-      }
-    } catch {}
-    await updateWarRoomMembers(row.id, Array.from(members));
-    await interaction.reply({
-      content: `✅ Removed <@${userId}> from this war room.`,
-      ephemeral: true,
-    });
-  }
-}
-
 async function handleRefreshDossier(interaction: ButtonInteraction) {
   const row = await requireWarRoomFromButton(interaction);
   if (!row) return;
@@ -725,15 +781,15 @@ async function handleRefreshDossier(interaction: ButtonInteraction) {
   const dossier = await fetchNationDossier(row.target_nation_id);
 
   const guild = interaction.guild!;
-  let chan = await guild.channels.fetch(row.channel_id).catch(() => null);
-  if (!chan || !chan.isTextBased()) {
+  const chan = await guild.channels.fetch(row.channel_id).catch(() => null);
+  if (!chan || !(chan as any).isTextBased?.()) {
     await interaction.editReply({
       content: "Channel missing; cannot refresh dossier.",
     });
     return;
   }
 
-  let controlMsg = null;
+  let controlMsg: any = null;
   if (row.control_message_id) {
     controlMsg = await (chan as any).messages
       .fetch(row.control_message_id)
@@ -768,7 +824,7 @@ async function handleClose(interaction: ButtonInteraction) {
   const chan = await guild.channels.fetch(row.channel_id).catch(() => null);
 
   if (chan) {
-    await chan.send("🔒 War room closing…");
+    await (chan as any).send("🔒 War room closing…").catch(() => {});
     await chan.delete().catch(() => {});
   }
 
@@ -780,9 +836,9 @@ async function handleClose(interaction: ButtonInteraction) {
   });
 }
 
-// --- Exported command -------------------------------------------------
+// ---- exported command -----------------------------------------------
 
-const cmd: Cmd = {
+const command: Command = {
   data: new SlashCommandBuilder()
     .setName("warroom")
     .setDescription("War room tools")
@@ -811,7 +867,7 @@ const cmd: Cmd = {
             .setName("member3")
             .setDescription("Third member to add"),
         ),
-    ),
+    ) as SlashCommandBuilder | SlashCommandSubcommandsOnlyBuilder,
 
   async execute(interaction: ChatInputCommandInteraction) {
     const sub = interaction.options.getSubcommand();
@@ -855,4 +911,4 @@ const cmd: Cmd = {
   },
 };
 
-export default cmd;
+export default command;
