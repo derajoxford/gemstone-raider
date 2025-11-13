@@ -1,7 +1,4 @@
 // src/index.ts
-// Runtime entry for the bot. Safe for ESM: defines `require` via createRequire,
-// but you can also compile to CJS and it still works fine.
-
 import "dotenv/config";
 import {
   Client,
@@ -10,11 +7,10 @@ import {
   Interaction,
   MessageFlags,
 } from "discord.js";
-import type { ButtonInteraction, ModalSubmitInteraction } from "discord.js";
 import fs from "node:fs";
 import path from "node:path";
 import { createRequire } from "node:module";
-const require = createRequire(import.meta.url); // allow require() inside ESM
+const require = createRequire(import.meta.url);
 
 import type { Command } from "./types/command.js";
 import { startAidPoller } from "./jobs/poll_aid.js";
@@ -29,99 +25,36 @@ if (!token || !appId) {
   throw new Error("Missing DISCORD_TOKEN or DISCORD_APP_ID");
 }
 
-// Minimal intents: NO privileged intents required
-const client = new Client({
-  intents: [GatewayIntentBits.Guilds],
-});
+const client = new Client({ intents: [GatewayIntentBits.Guilds] });
 
-// In-memory command registry (name -> handler)
+// name -> command impl
 const commands = new Collection<string, Command>();
 
-/**
- * Load compiled commands from dist/commands (built .js files).
- * This uses `require()` via createRequire so it works even when the package is ESM.
- */
 function loadCommands() {
   const commandsPath = path.join(process.cwd(), "dist", "commands");
   if (!fs.existsSync(commandsPath)) {
     console.warn("dist/commands not found; did you build?");
     return;
   }
-
   const files = fs.readdirSync(commandsPath).filter((f) => f.endsWith(".js"));
   for (const file of files) {
     try {
       const mod = require(path.join(commandsPath, file));
       const cmd: Command = mod.default;
-      if (!cmd?.data?.name || typeof cmd.execute !== "function") {
-        console.warn(`Skipping ${file}: no valid default export`);
-        continue;
-      }
-      // Optional component handlers (buttons/modals) supported if present
-      // @ts-expect-error - extra fields are allowed at runtime
-      if (typeof mod.default.handleButton === "function") {
-        // ok
-      }
-      // @ts-expect-error - extra fields are allowed at runtime
-      if (typeof mod.default.handleModal === "function") {
-        // ok
-      }
+      if (!cmd?.data || typeof cmd.execute !== "function") continue;
+      // registry honors optional disabled
+      // @ts-ignore - at runtime it's fine
+      if (cmd.disabled) continue;
       commands.set(cmd.data.name, cmd);
     } catch (e) {
       console.error(`Failed loading command ${file}:`, e);
     }
   }
-
   console.log(`Loaded ${commands.size} command(s).`);
 }
 
-// Helper: delegate a button to any command that exports handleButton(interaction)
-async function delegateButton(interaction: ButtonInteraction): Promise<boolean> {
-  for (const cmd of commands.values()) {
-    // @ts-expect-error - runtime optional handler
-    const handler = (cmd as any).handleButton;
-    if (typeof handler === "function") {
-      try {
-        const before = { replied: interaction.replied, deferred: interaction.deferred };
-        const res = await handler(interaction);
-        if (res === true) return true;
-        if (interaction.replied !== before.replied || interaction.deferred !== before.deferred) {
-          return true;
-        }
-      } catch (err) {
-        console.error(`[delegateButton] handler error for ${cmd.data?.name}:`, err);
-      }
-    }
-  }
-  return false;
-}
-
-// Helper: delegate a modal to any command that exports handleModal(interaction)
-async function delegateModal(interaction: ModalSubmitInteraction): Promise<boolean> {
-  for (const cmd of commands.values()) {
-    // @ts-expect-error - runtime optional handler
-    const handler = (cmd as any).handleModal;
-    if (typeof handler === "function") {
-      try {
-        const before = { replied: interaction.replied, deferred: interaction.deferred };
-        const res = await handler(interaction);
-        if (res === true) return true;
-        if (interaction.replied !== before.replied || interaction.deferred !== before.deferred) {
-          return true;
-        }
-      } catch (err) {
-        console.error(`[delegateModal] handler error for ${cmd.data?.name}:`, err);
-      }
-    }
-  }
-  return false;
-}
-
-// Fired when bot is ready
 client.once("ready", async () => {
   console.log(`✅ Logged in as ${client.user?.tag}`);
-
-  // Start background jobs
   try {
     startAidPoller(client);
   } catch (e) {
@@ -134,22 +67,30 @@ client.once("ready", async () => {
   }
 });
 
-// Main interaction router
 client.on("interactionCreate", async (interaction: Interaction) => {
   try {
     // Slash commands
     if (interaction.isChatInputCommand()) {
       const command = commands.get(interaction.commandName);
       if (!command) return;
-      await command.execute(interaction as any);
+      await command.execute(interaction);
       return;
     }
 
-    // Buttons
+    // Modals — let any command that cares handle it
+    if (interaction.isModalSubmit()) {
+      for (const cmd of commands.values()) {
+        if (typeof cmd.handleModal === "function") {
+          await cmd.handleModal(interaction);
+        }
+      }
+      return;
+    }
+
+    // Buttons: first, watcher toggles
     if (interaction.isButton()) {
       const cid = interaction.customId || "";
 
-      // 🔔 Toggle watch on a nation (customId format: "watch:toggle:<nationId>")
       if (cid.startsWith("watch:toggle:")) {
         const nationId = Number(cid.split(":")[2] || 0);
         if (!Number.isFinite(nationId) || nationId <= 0) {
@@ -159,16 +100,14 @@ client.on("interactionCreate", async (interaction: Interaction) => {
           });
           return;
         }
-
         const uid = interaction.user.id;
         const gid = interaction.guildId!;
         const gs = await getGuildSettings(gid);
 
-        // Check if already watched
         const exists = await (async () => {
           const { rows } = await query(
             "SELECT 1 FROM watchlist WHERE discord_user_id=$1 AND nation_id=$2",
-            [uid, nationId]
+            [uid, nationId],
           );
           return rows.length > 0;
         })();
@@ -191,21 +130,20 @@ client.on("interactionCreate", async (interaction: Interaction) => {
         return;
       }
 
-      // Delegate any other buttons (e.g., warroom controls) to command modules
-      const handled = await delegateButton(interaction);
-      if (handled) return;
-    }
-
-    // Modal submissions (e.g., warroom setup/add/remove)
-    if (interaction.isModalSubmit()) {
-      const handled = await delegateModal(interaction);
-      if (handled) return;
-      // If unhandled, stay silent to avoid noise
-      return;
+      // Delegate to commands that implement handleButton
+      for (const cmd of commands.values()) {
+        if (typeof cmd.handleButton === "function") {
+          try {
+            const handled = await cmd.handleButton(interaction);
+            if (handled) return;
+          } catch (e) {
+            // let other handlers try
+          }
+        }
+      }
     }
   } catch (e) {
     console.error("interaction error:", e);
-    // best-effort reply (avoid double-reply)
     try {
       if (
         interaction.isRepliable() &&
@@ -221,11 +159,9 @@ client.on("interactionCreate", async (interaction: Interaction) => {
   }
 });
 
-// Boot
 loadCommands();
 client.login(token);
 
-// Graceful shutdown
 process.on("SIGINT", () => {
   console.log("Shutting down…");
   client.destroy();
