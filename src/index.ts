@@ -19,6 +19,7 @@ import { addOrUpdateWatch, removeWatch } from "./data/watch.js";
 import { getGuildSettings } from "./data/settings.js";
 import { query } from "./data/db.js";
 import { ensureCommandAllowed } from "./command_gate.js"; // 👈 NEW
+import { startWarAlertsFromEnv } from "./warAlerts.js";   // 👈 WAR ALERTS
 
 const token = process.env.DISCORD_TOKEN!;
 const appId = process.env.DISCORD_APP_ID!;
@@ -64,6 +65,11 @@ client.once("ready", async () => {
     startWatchRadar(client);
   } catch (e) {
     console.error("Failed to start Watch Radar:", e);
+  }
+  try {
+    startWarAlertsFromEnv(client);
+  } catch (e) {
+    console.error("Failed to start War Alerts:", e);
   }
 });
 
