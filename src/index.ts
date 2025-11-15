@@ -18,6 +18,7 @@ import { startWatchRadar } from "./jobs/radar_watch.js";
 import { addOrUpdateWatch, removeWatch } from "./data/watch.js";
 import { getGuildSettings } from "./data/settings.js";
 import { query } from "./data/db.js";
+import { ensureCommandAllowed } from "./command_gate.js"; // 👈 NEW
 
 const token = process.env.DISCORD_TOKEN!;
 const appId = process.env.DISCORD_APP_ID!;
@@ -69,6 +70,12 @@ client.once("ready", async () => {
 client.on("interactionCreate", async (interaction: Interaction) => {
   try {
     if (interaction.isChatInputCommand()) {
+      // 👇 Gate everything except /command_roles itself
+      if (interaction.commandName !== "command_roles") {
+        const ok = await ensureCommandAllowed(interaction);
+        if (!ok) return;
+      }
+
       const command = commands.get(interaction.commandName);
       if (!command) return;
       await command.execute(interaction);
