@@ -1,6 +1,7 @@
 // src/commands/dossier.ts
 import {
   SlashCommandBuilder,
+  SlashCommandOptionsOnlyBuilder,
   MessageFlags,
   type ChatInputCommandInteraction,
 } from "discord.js";
@@ -13,7 +14,9 @@ import { dossierEmbed } from "../ui/dossier.js";
 const DECL_MIN = 0.75;
 const DECL_MAX = 2.5;
 
-const data: SlashCommandBuilder = new SlashCommandBuilder()
+// Note: new SlashCommandBuilder() is inferred as SlashCommandOptionsOnlyBuilder
+// for option-only commands, so we type it that way to satisfy TS.
+const data: SlashCommandOptionsOnlyBuilder = new SlashCommandBuilder()
   .setName("dossier")
   .setDescription("Deep intel card for a target nation")
   .addStringOption((o) =>
@@ -83,10 +86,17 @@ const execute = async (interaction: ChatInputCommandInteraction) => {
     status: status as any,
   });
 
-  await interaction.reply({ ...(payload as any), flags: MessageFlags.Ephemeral });
+  await interaction.reply({
+    ...(payload as any),
+    flags: MessageFlags.Ephemeral,
+  });
 };
 
-function rangeStatus(attackerScore: number, targetScore: number, nearPct: number) {
+function rangeStatus(
+  attackerScore: number,
+  targetScore: number,
+  nearPct: number,
+) {
   const min = attackerScore * DECL_MIN;
   const max = attackerScore * DECL_MAX;
   const inRange = targetScore >= min && targetScore <= max;
