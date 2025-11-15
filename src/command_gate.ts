@@ -4,7 +4,7 @@ import {
   GuildMember,
   PermissionFlagsBits,
 } from "discord.js";
-import { pool } from "./db";
+import { pool } from "./db.js";
 
 const OWNER_IDS = ["763620668175941662"]; // you
 
@@ -31,7 +31,6 @@ interface CommandPermissionRow {
 
 /**
  * Pure check: returns true if this user is allowed to run this command.
- * DOES NOT send a reply. Use ensureCommandAllowed() in most places.
  */
 export async function checkCommandAllowed(
   i: ChatInputCommandInteraction,
@@ -77,7 +76,7 @@ export async function checkCommandAllowed(
 }
 
 /**
- * Convenience wrapper: checks and, if denied, sends an ephemeral message.
+ * Wrapper: checks and, if denied, sends an ephemeral message.
  * Returns true if allowed, false if blocked.
  */
 export async function ensureCommandAllowed(
