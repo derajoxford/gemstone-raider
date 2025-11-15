@@ -7,7 +7,8 @@ import {
   EmbedBuilder,
   GuildMember,
 } from "discord.js";
-import { pool } from "../db";
+import type { Command } from "../types/command.js";
+import { pool } from "../db.js";
 
 const OWNER_IDS = ["763620668175941662"];
 
@@ -51,7 +52,6 @@ interface CommandPermissionRow {
 export const data = new SlashCommandBuilder()
   .setName("command_roles")
   .setDescription("Manage which roles can run specific commands in this server")
-  // Keep Discord-side barrier minimal; we enforce Admin/ManageGuild in handler
   .addSubcommand((sc) =>
     sc
       .setName("set")
@@ -370,3 +370,10 @@ export async function execute(i: ChatInputCommandInteraction) {
 
   await i.reply({ ephemeral: true, content: "Unknown subcommand." });
 }
+
+const command: Command = {
+  data,
+  execute,
+};
+
+export default command;
