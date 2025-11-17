@@ -11,6 +11,8 @@ import {
   TextChannel,
 } from "discord.js";
 
+// ---- GraphQL queries ----
+
 const WAR_QUERY = `
 {
   wars(first: 50) {
@@ -42,6 +44,29 @@ const WAR_QUERY = `
   }
 }
 `;
+
+function nationMilQuery(nationId: string | number): string {
+  // GraphQL nations query with spies included
+  return `
+  {
+    nations(id: ${nationId}, first: 1) {
+      data {
+        id
+        nation_name
+        alliance_id
+        soldiers
+        tanks
+        aircraft
+        ships
+        missiles
+        nukes
+        spies
+      }
+    }
+  }`;
+}
+
+// ---- Types ----
 
 interface WarSideAlliance {
   id: string;
@@ -80,6 +105,26 @@ interface WarApiResponse {
   errors?: { message: string }[];
 }
 
+interface NationGraphResponse {
+  data?: {
+    nations?: {
+      data?: Array<{
+        id: string;
+        nation_name: string;
+        alliance_id: string;
+        soldiers: any;
+        tanks: any;
+        aircraft: any;
+        ships: any;
+        missiles: any;
+        nukes: any;
+        spies: any;
+      }>;
+    };
+  };
+  errors?: { message: string }[];
+}
+
 interface WarMessageRef {
   warId: string;
   channelId: string;
@@ -97,6 +142,8 @@ interface NationMilitary {
   spies: number | null;
 }
 
+// ---- State ----
+
 const warMessageMap = new Map<string, WarMessageRef>();
 
 const MILITARY_CACHE_TTL_MS = 2 * 60 * 1000;
@@ -104,6 +151,8 @@ const militaryCache = new Map<
   string,
   { data: NationMilitary; fetchedAt: number }
 >();
+
+// ---- HTTP helpers ----
 
 function httpPost(
   hostname: string,
@@ -139,33 +188,7 @@ function httpPost(
   });
 }
 
-function httpGet(
-  hostname: string,
-  path: string,
-): Promise<{ statusCode?: number; body: string }> {
-  return new Promise((resolve, reject) => {
-    const req = https.request(
-      {
-        hostname,
-        path,
-        method: "GET",
-      },
-      (res) => {
-        let body = "";
-        res.setEncoding("utf8");
-        res.on("data", (chunk) => {
-          body += chunk;
-        });
-        res.on("end", () => {
-          resolve({ statusCode: res.statusCode, body });
-        });
-      },
-    );
-
-    req.on("error", (err) => reject(err));
-    req.end();
-  });
-}
+// ---- utils ----
 
 function parseNum(v: any): number | null {
   if (v === null || v === undefined) return null;
@@ -177,6 +200,8 @@ function formatNum(n: number | null): string {
   if (n === null || Number.isNaN(n)) return "?";
   return n.toLocaleString("en-US");
 }
+
+// ---- GraphQL calls ----
 
 async function fetchWars(apiKey: string): Promise<War[]> {
   const payload = JSON.stringify({ query: WAR_QUERY });
@@ -220,50 +245,58 @@ async function fetchNationMilitary(
     return cached.data;
   }
 
+  const payload = JSON.stringify({ query: nationMilQuery(nationId) });
+
   try {
-    const { statusCode, body } = await httpGet(
-      "politicsandwar.com",
-      `/api/nation/id=${encodeURIComponent(nationId)}&key=${encodeURIComponent(
-        apiKey,
-      )}`,
+    const { statusCode, body } = await httpPost(
+      "api.politicsandwar.com",
+      `/graphql?api_key=${apiKey}`,
+      payload,
     );
 
     if (statusCode && statusCode >= 400) {
       console.error(
-        "[war-alerts] nation API HTTP error",
+        "[war-alerts] nation GQL HTTP error",
         statusCode,
         body.slice(0, 300),
       );
       return null;
     }
 
-    const json: any = JSON.parse(body);
-    if (json && json.success === false) {
-      console.warn(
-        "[war-alerts] nation API error",
-        nationId,
-        json.error ?? body.slice(0, 200),
+    const json = JSON.parse(body) as NationGraphResponse;
+    if (json.errors && json.errors.length > 0) {
+      console.error(
+        "[war-alerts] nation GQL errors",
+        json.errors.map((e) => e.message).join("; "),
       );
       return null;
     }
 
+    const node = json.data?.nations?.data?.[0];
+    if (!node) {
+      console.warn("[war-alerts] nation not found in GQL", nationId);
+      return null;
+    }
+
     const mil: NationMilitary = {
-      soldiers: parseNum(json.soldiers),
-      tanks: parseNum(json.tanks),
-      aircraft: parseNum(json.aircraft),
-      ships: parseNum(json.ships),
-      missiles: parseNum(json.missiles),
-      nukes: parseNum(json.nukes),
-      spies: parseNum(json.spies), // may be null / missing
+      soldiers: parseNum(node.soldiers),
+      tanks: parseNum(node.tanks),
+      aircraft: parseNum(node.aircraft),
+      ships: parseNum(node.ships),
+      missiles: parseNum(node.missiles),
+      nukes: parseNum(node.nukes),
+      spies: parseNum(node.spies),
     };
 
     militaryCache.set(nationId, { data: mil, fetchedAt: now });
     return mil;
   } catch (err) {
-    console.error("[war-alerts] nation API fetch failed", nationId, err);
+    console.error("[war-alerts] nation GQL fetch failed", nationId, err);
     return null;
   }
 }
+
+// ---- embed helpers ----
 
 function warStatus(war: War): string {
   if (war.winner_id && war.winner_id !== "0") return "Finished";
@@ -417,8 +450,16 @@ function isTextChannel(ch: Channel | null): ch is TextChannel {
   return !!ch && (ch as TextChannel).send !== undefined;
 }
 
+// ---- env + runner ----
+
 function getEnv() {
-  const apiKey = (process.env.PNW_GRAPH_KEY || process.env.PNW_API_KEY || "").trim();
+  const apiKey = (
+    process.env.PNW_GRAPH_KEY ||
+    process.env.PNW_API_KEY ||
+    process.env.PNW_SERVICE_API_KEY ||
+    process.env.PNW_DEFAULT_API_KEY ||
+    ""
+  ).trim();
   const allianceId = (process.env.WAR_ALERTS_AID || "").trim();
   const guildId = (process.env.WAR_ALERTS_GUILD_ID || "").trim();
   const offenseChannelId = (process.env.WAR_ALERTS_OFFENSE_CHANNEL_ID || "").trim();
@@ -462,7 +503,7 @@ export function startWarAlertsFromEnv(client: Client): void {
 
   if (!apiKey) {
     console.warn(
-      "[war-alerts] PNW_GRAPH_KEY or PNW_API_KEY not set, cannot start war alerts.",
+      "[war-alerts] no PNW API key set (PNW_GRAPH_KEY / PNW_API_KEY / PNW_SERVICE_API_KEY / PNW_DEFAULT_API_KEY), cannot start war alerts.",
     );
     return;
   }
@@ -555,8 +596,8 @@ export function startWarAlertsFromEnv(client: Client): void {
           try {
             const msg = await channel.messages.fetch(existing.messageId);
             await msg.edit({ embeds: [embed], components });
-          } catch (err) {
-            // Message missing or fetch failed; drop reference so it will recreate next poll
+          } catch {
+            // message missing; recreate next poll
             warMessageMap.delete(key);
           }
         }
@@ -571,6 +612,8 @@ export function startWarAlertsFromEnv(client: Client): void {
     void pollOnce();
   }, intervalMs);
 }
+
+// ---- button handler ----
 
 export async function handleWarButtonInteraction(
   interaction: ButtonInteraction,
