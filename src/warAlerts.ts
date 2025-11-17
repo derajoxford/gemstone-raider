@@ -1,10 +1,14 @@
 // src/warAlerts.ts
 import * as https from "https";
 import {
-  Client,
-  TextChannel,
-  EmbedBuilder,
+  ActionRowBuilder,
+  ButtonBuilder,
+  ButtonInteraction,
+  ButtonStyle,
   Channel,
+  Client,
+  EmbedBuilder,
+  TextChannel,
 } from "discord.js";
 
 const WAR_QUERY = `
@@ -83,16 +87,34 @@ interface WarMessageRef {
   isDefensive: boolean;
 }
 
+interface NationMilitary {
+  soldiers: number | null;
+  tanks: number | null;
+  aircraft: number | null;
+  ships: number | null;
+  missiles: number | null;
+  nukes: number | null;
+  spies: number | null;
+}
+
 const warMessageMap = new Map<string, WarMessageRef>();
 
-function fetchWars(apiKey: string): Promise<War[]> {
-  return new Promise((resolve, reject) => {
-    const payload = JSON.stringify({ query: WAR_QUERY });
+const MILITARY_CACHE_TTL_MS = 2 * 60 * 1000;
+const militaryCache = new Map<
+  string,
+  { data: NationMilitary; fetchedAt: number }
+>();
 
+function httpPost(
+  hostname: string,
+  path: string,
+  payload: string,
+): Promise<{ statusCode?: number; body: string }> {
+  return new Promise((resolve, reject) => {
     const req = https.request(
       {
-        hostname: "api.politicsandwar.com",
-        path: `/graphql?api_key=${apiKey}`,
+        hostname,
+        path,
         method: "POST",
         headers: {
           "Content-Type": "application/json",
@@ -106,101 +128,287 @@ function fetchWars(apiKey: string): Promise<War[]> {
           body += chunk;
         });
         res.on("end", () => {
-          try {
-            if (res.statusCode && res.statusCode >= 400) {
-              console.error(
-                "[war-alerts] HTTP error",
-                res.statusCode,
-                body.slice(0, 300)
-              );
-              return resolve([]);
-            }
-            const json = JSON.parse(body) as WarApiResponse;
-            if (json.errors && json.errors.length > 0) {
-              console.error(
-                "[war-alerts] GraphQL errors",
-                json.errors.map((e) => e.message).join("; ")
-              );
-              return resolve([]);
-            }
-            const wars = json.data?.wars?.data ?? [];
-            resolve(wars);
-          } catch (err) {
-            console.error("[war-alerts] failed to parse response", err);
-            resolve([]);
-          }
+          resolve({ statusCode: res.statusCode, body });
         });
-      }
+      },
     );
 
-    req.on("error", (err) => {
-      console.error("[war-alerts] request error", err);
-      resolve([]);
-    });
-
+    req.on("error", (err) => reject(err));
     req.write(payload);
     req.end();
   });
 }
 
-function buildWarEmbed(war: War, ourAllianceId: string): EmbedBuilder {
+function httpGet(
+  hostname: string,
+  path: string,
+): Promise<{ statusCode?: number; body: string }> {
+  return new Promise((resolve, reject) => {
+    const req = https.request(
+      {
+        hostname,
+        path,
+        method: "GET",
+      },
+      (res) => {
+        let body = "";
+        res.setEncoding("utf8");
+        res.on("data", (chunk) => {
+          body += chunk;
+        });
+        res.on("end", () => {
+          resolve({ statusCode: res.statusCode, body });
+        });
+      },
+    );
+
+    req.on("error", (err) => reject(err));
+    req.end();
+  });
+}
+
+function parseNum(v: any): number | null {
+  if (v === null || v === undefined) return null;
+  const n = Number(v);
+  return Number.isFinite(n) ? n : null;
+}
+
+function formatNum(n: number | null): string {
+  if (n === null || Number.isNaN(n)) return "?";
+  return n.toLocaleString("en-US");
+}
+
+async function fetchWars(apiKey: string): Promise<War[]> {
+  const payload = JSON.stringify({ query: WAR_QUERY });
+
+  try {
+    const { statusCode, body } = await httpPost(
+      "api.politicsandwar.com",
+      `/graphql?api_key=${apiKey}`,
+      payload,
+    );
+
+    if (statusCode && statusCode >= 400) {
+      console.error("[war-alerts] HTTP error", statusCode, body.slice(0, 300));
+      return [];
+    }
+
+    const json = JSON.parse(body) as WarApiResponse;
+    if (json.errors && json.errors.length > 0) {
+      console.error(
+        "[war-alerts] GraphQL errors",
+        json.errors.map((e) => e.message).join("; "),
+      );
+      return [];
+    }
+    return json.data?.wars?.data ?? [];
+  } catch (err) {
+    console.error("[war-alerts] failed to fetch wars", err);
+    return [];
+  }
+}
+
+async function fetchNationMilitary(
+  apiKey: string,
+  nationId: string,
+): Promise<NationMilitary | null> {
+  if (!apiKey) return null;
+
+  const cached = militaryCache.get(nationId);
+  const now = Date.now();
+  if (cached && now - cached.fetchedAt < MILITARY_CACHE_TTL_MS) {
+    return cached.data;
+  }
+
+  try {
+    const { statusCode, body } = await httpGet(
+      "politicsandwar.com",
+      `/api/nation/id=${encodeURIComponent(nationId)}&key=${encodeURIComponent(
+        apiKey,
+      )}`,
+    );
+
+    if (statusCode && statusCode >= 400) {
+      console.error(
+        "[war-alerts] nation API HTTP error",
+        statusCode,
+        body.slice(0, 300),
+      );
+      return null;
+    }
+
+    const json: any = JSON.parse(body);
+    if (json && json.success === false) {
+      console.warn(
+        "[war-alerts] nation API error",
+        nationId,
+        json.error ?? body.slice(0, 200),
+      );
+      return null;
+    }
+
+    const mil: NationMilitary = {
+      soldiers: parseNum(json.soldiers),
+      tanks: parseNum(json.tanks),
+      aircraft: parseNum(json.aircraft),
+      ships: parseNum(json.ships),
+      missiles: parseNum(json.missiles),
+      nukes: parseNum(json.nukes),
+      spies: parseNum(json.spies), // may be null / missing
+    };
+
+    militaryCache.set(nationId, { data: mil, fetchedAt: now });
+    return mil;
+  } catch (err) {
+    console.error("[war-alerts] nation API fetch failed", nationId, err);
+    return null;
+  }
+}
+
+function warStatus(war: War): string {
+  if (war.winner_id && war.winner_id !== "0") return "Finished";
+  if (war.turns_left <= 0) return "Expired";
+  return "Active";
+}
+
+function warUrl(warId: string): string {
+  return `https://politicsandwar.com/nation/war/timeline/war=${warId}`;
+}
+
+function nationUrl(id: string): string {
+  return `https://politicsandwar.com/nation/id=${id}`;
+}
+
+function allianceUrl(id: string): string {
+  return `https://politicsandwar.com/alliance/id=${id}`;
+}
+
+function formatSideBlock(
+  war: War,
+  side: "ATTACKER" | "DEFENDER",
+  mil: NationMilitary | null,
+): string {
+  const isAtt = side === "ATTACKER";
+  const node = isAtt ? war.attacker : war.defender;
+  const nationId = isAtt ? war.att_id : war.def_id;
+
+  const hasGC = war.ground_control === nationId;
+  const hasNB = war.naval_blockade === nationId;
+
+  const lines: string[] = [];
+
+  const nationName = node?.nation_name ?? "Unknown";
+  lines.push(`**[${nationName}](${nationUrl(nationId)})**`);
+
+  const allianceId = node?.alliance_id ?? "0";
+  const allianceName =
+    node?.alliance?.name ??
+    (allianceId === "0" ? "None" : `Unknown (#${allianceId})`);
+
+  if (allianceId !== "0" && node?.alliance?.name) {
+    lines.push(`Alliance: [${allianceName}](${allianceUrl(allianceId)})`);
+  } else {
+    lines.push(`Alliance: ${allianceName}`);
+  }
+
+  lines.push(`Nation ID: \`${nationId}\``);
+  lines.push("");
+  lines.push(`🟩 Ground Control: ${hasGC ? "✅" : "❌"}`);
+  lines.push(`🚫 Naval Blockade: ${hasNB ? "✅" : "❌"}`);
+
+  if (mil) {
+    lines.push("");
+    lines.push(`💂 **Soldiers:** ${formatNum(mil.soldiers)}`);
+    lines.push(`🛡️ **Tanks:** ${formatNum(mil.tanks)}`);
+    lines.push(`✈️ **Aircraft:** ${formatNum(mil.aircraft)}`);
+    lines.push(`🚢 **Ships:** ${formatNum(mil.ships)}`);
+    lines.push(`🎯 **Missiles:** ${formatNum(mil.missiles)}`);
+    lines.push(`☢️ **Nukes:** ${formatNum(mil.nukes)}`);
+    lines.push(`🕵️ **Spies:** ${formatNum(mil.spies)}`);
+  }
+
+  return lines.join("\n");
+}
+
+function buildComponents(warId: string) {
+  const openButton = new ButtonBuilder()
+    .setStyle(ButtonStyle.Link)
+    .setLabel("Open War")
+    .setEmoji("🌐")
+    .setURL(warUrl(warId));
+
+  const refreshButton = new ButtonBuilder()
+    .setStyle(ButtonStyle.Primary)
+    .setLabel("Refresh")
+    .setEmoji("🔄")
+    .setCustomId(`war:refresh:${warId}`);
+
+  const row = new ActionRowBuilder<ButtonBuilder>().addComponents(
+    openButton,
+    refreshButton,
+  );
+
+  return [row];
+}
+
+function buildWarEmbed(
+  war: War,
+  ourAllianceId: string,
+  attMil: NationMilitary | null,
+  defMil: NationMilitary | null,
+): EmbedBuilder {
   const isOffense = war.att_alliance_id === ourAllianceId;
   const isDefense = war.def_alliance_id === ourAllianceId;
 
-  const titlePrefix = isOffense ? "⚔️ Offensive War" : isDefense ? "🛡️ Defensive War" : "⚔️ War";
-  const status = war.winner_id === "0" ? "Active" : "Ended";
+  const side =
+    isOffense ? "OFFENSE" : isDefense ? "DEFENSE" : ("NONE" as const);
 
-  const startedIso = war.date;
-  const turnsLeft = war.turns_left;
-
-  const attackerUrl = `https://politicsandwar.com/nation/id=${war.att_id}`;
-  const defenderUrl = `https://politicsandwar.com/nation/id=${war.def_id}`;
-
-  const attackerAllianceName =
-    war.attacker.alliance?.name ?? (war.att_alliance_id === "0" ? "None" : `Unknown (#${war.att_alliance_id})`);
-  const defenderAllianceName =
-    war.defender.alliance?.name ?? (war.def_alliance_id === "0" ? "None" : `Unknown (#${war.def_alliance_id})`);
-
-  const attackerHasGround = war.ground_control === war.att_id;
-  const defenderHasGround = war.ground_control === war.def_id;
-
-  const attackerHasNaval = war.naval_blockade === war.att_id;
-  const defenderHasNaval = war.naval_blockade === war.def_id;
-
-  const attackerFieldValue = [
-    `**[${war.attacker.nation_name}](${attackerUrl})**`,
-    `Alliance: ${attackerAllianceName}`,
-    `Nation ID: ${war.att_id}`,
-    `Ground Control: ${attackerHasGround ? "✅" : "❌"}`,
-    `Naval Blockade: ${attackerHasNaval ? "✅" : "❌"}`,
-  ].join("\n");
-
-  const defenderFieldValue = [
-    `**[${war.defender.nation_name}](${defenderUrl})**`,
-    `Alliance: ${defenderAllianceName}`,
-    `Nation ID: ${war.def_id}`,
-    `Ground Control: ${defenderHasGround ? "✅" : "❌"}`,
-    `Naval Blockade: ${defenderHasNaval ? "✅" : "❌"}`,
-  ].join("\n");
-
-  const ourSide = isOffense ? "Attacker" : isDefense ? "Defender" : "Unknown";
+  const titleEmoji = side === "OFFENSE" ? "⚔️" : "🛡️";
+  const color = side === "OFFENSE" ? 0xf39c12 : 0x3498db;
 
   const description = [
-    `Type: ${war.war_type}`,
-    `Started: ${startedIso}`,
-    `Status: ${status}`,
-    `Turns Left: ${turnsLeft}`,
+    `Type: **${war.war_type}**`,
+    `Started: **${war.date}**`,
+    `Status: **${warStatus(war)}**`,
+    `Turns Left: **${war.turns_left}**`,
   ].join(" • ");
 
+  const ourSideText =
+    side === "OFFENSE"
+      ? "🗡️ Attacker"
+      : side === "DEFENSE"
+      ? "🛡️ Defender"
+      : "❓ Not involved";
+
   const embed = new EmbedBuilder()
-    .setTitle(`${titlePrefix} #${war.id}`)
+    .setTitle(
+      `${titleEmoji} ${
+        side === "OFFENSE" ? "Offensive" : "Defensive"
+      } War #${war.id}`,
+    )
     .setDescription(description)
     .addFields(
-      { name: "Attacker", value: attackerFieldValue, inline: true },
-      { name: "Defender", value: defenderFieldValue, inline: true },
-      { name: "Our Side", value: ourSide, inline: false }
+      {
+        name: "Attacker",
+        value: formatSideBlock(war, "ATTACKER", attMil),
+        inline: false, // stacked
+      },
+      {
+        name: "Defender",
+        value: formatSideBlock(war, "DEFENDER", defMil),
+        inline: false, // stacked
+      },
+      {
+        name: "Our Side",
+        value: ourSideText,
+        inline: false,
+      },
     )
-    .setColor(isDefense ? 0xff4d4d : 0xffa200);
+    .setColor(color)
+    .setFooter({
+      text: "War alerts • auto-updating • use 🔄 Refresh for the latest snapshot",
+    })
+    .setTimestamp(new Date());
 
   return embed;
 }
@@ -209,31 +417,58 @@ function isTextChannel(ch: Channel | null): ch is TextChannel {
   return !!ch && (ch as TextChannel).send !== undefined;
 }
 
-export function startWarAlertsFromEnv(client: Client): void {
+function getEnv() {
+  const apiKey = (process.env.PNW_GRAPH_KEY || process.env.PNW_API_KEY || "").trim();
+  const allianceId = (process.env.WAR_ALERTS_AID || "").trim();
+  const guildId = (process.env.WAR_ALERTS_GUILD_ID || "").trim();
+  const offenseChannelId = (process.env.WAR_ALERTS_OFFENSE_CHANNEL_ID || "").trim();
+  const defenseChannelId = (process.env.WAR_ALERTS_DEFENSE_CHANNEL_ID || "").trim();
+  const defensePingRoleId =
+    (process.env.WAR_ALERTS_DEFENSE_PING_ROLE_ID || "").trim() || undefined;
+  const intervalMs = Number(process.env.WAR_ALERTS_INTERVAL_MS || "60000");
+
   const enabled =
     process.env.WAR_ALERTS_ENABLED === "1" ||
-    process.env.WAR_ALERTS_ENABLED === "true";
+    (process.env.WAR_ALERTS_ENABLED || "").toLowerCase() === "true";
+
+  return {
+    enabled,
+    apiKey,
+    allianceId,
+    guildId,
+    offenseChannelId,
+    defenseChannelId,
+    defensePingRoleId,
+    intervalMs,
+  };
+}
+
+export function startWarAlertsFromEnv(client: Client): void {
+  const {
+    enabled,
+    apiKey,
+    allianceId,
+    guildId,
+    offenseChannelId,
+    defenseChannelId,
+    defensePingRoleId,
+    intervalMs,
+  } = getEnv();
 
   if (!enabled) {
     console.log("[war-alerts] disabled via WAR_ALERTS_ENABLED");
     return;
   }
 
-  const apiKey = (process.env.PNW_GRAPH_KEY || process.env.PNW_API_KEY || "").trim();
-  const allianceId = (process.env.WAR_ALERTS_AID || "").trim();
-  const guildId = (process.env.WAR_ALERTS_GUILD_ID || "").trim();
-  const offenseChannelId = (process.env.WAR_ALERTS_OFFENSE_CHANNEL_ID || "").trim();
-  const defenseChannelId = (process.env.WAR_ALERTS_DEFENSE_CHANNEL_ID || "").trim();
-  const defensePingRoleId = (process.env.WAR_ALERTS_DEFENSE_PING_ROLE_ID || "").trim() || undefined;
-  const intervalMs = Number(process.env.WAR_ALERTS_INTERVAL_MS || "60000");
-
   if (!apiKey) {
-    console.warn("[war-alerts] PNW_GRAPH_KEY or PNW_API_KEY not set, cannot start war alerts.");
+    console.warn(
+      "[war-alerts] PNW_GRAPH_KEY or PNW_API_KEY not set, cannot start war alerts.",
+    );
     return;
   }
   if (!allianceId || !guildId || !offenseChannelId || !defenseChannelId) {
     console.warn(
-      "[war-alerts] missing config. Need WAR_ALERTS_AID, WAR_ALERTS_GUILD_ID, WAR_ALERTS_OFFENSE_CHANNEL_ID, WAR_ALERTS_DEFENSE_CHANNEL_ID."
+      "[war-alerts] missing config. Need WAR_ALERTS_AID, WAR_ALERTS_GUILD_ID, WAR_ALERTS_OFFENSE_CHANNEL_ID, WAR_ALERTS_DEFENSE_CHANNEL_ID.",
     );
     return;
   }
@@ -245,7 +480,7 @@ export function startWarAlertsFromEnv(client: Client): void {
     guildId,
     "interval",
     intervalMs,
-    "ms"
+    "ms",
   );
 
   async function pollOnce() {
@@ -255,21 +490,31 @@ export function startWarAlertsFromEnv(client: Client): void {
       const activeWars = wars.filter(
         (w) =>
           w.winner_id === "0" &&
-          (w.att_alliance_id === allianceId || w.def_alliance_id === allianceId)
+          (w.att_alliance_id === allianceId || w.def_alliance_id === allianceId),
       );
 
       if (activeWars.length === 0) {
         return;
       }
 
-      const offenseChannelRaw = await client.channels.fetch(offenseChannelId).catch(() => null);
-      const defenseChannelRaw = await client.channels.fetch(defenseChannelId).catch(() => null);
+      const offenseChannelRaw = await client.channels
+        .fetch(offenseChannelId)
+        .catch(() => null);
+      const defenseChannelRaw = await client.channels
+        .fetch(defenseChannelId)
+        .catch(() => null);
 
-      const offenseChannel = isTextChannel(offenseChannelRaw) ? offenseChannelRaw : null;
-      const defenseChannel = isTextChannel(defenseChannelRaw) ? defenseChannelRaw : null;
+      const offenseChannel = isTextChannel(offenseChannelRaw)
+        ? offenseChannelRaw
+        : null;
+      const defenseChannel = isTextChannel(defenseChannelRaw)
+        ? defenseChannelRaw
+        : null;
 
       if (!offenseChannel || !defenseChannel) {
-        console.warn("[war-alerts] offense/defense channels not found or not text-based.");
+        console.warn(
+          "[war-alerts] offense/defense channels not found or not text-based.",
+        );
         return;
       }
 
@@ -278,18 +523,26 @@ export function startWarAlertsFromEnv(client: Client): void {
         const isDefense = war.def_alliance_id === allianceId;
         const key = `${guildId}:${war.id}`;
 
-        const embed = buildWarEmbed(war, allianceId);
+        const [attMil, defMil] = await Promise.all([
+          fetchNationMilitary(apiKey, war.att_id),
+          fetchNationMilitary(apiKey, war.def_id),
+        ]);
+
+        const embed = buildWarEmbed(war, allianceId, attMil, defMil);
+        const components = buildComponents(war.id);
         const channel = isOffense ? offenseChannel : defenseChannel;
 
         const existing = warMessageMap.get(key);
         if (!existing) {
-          // New war: create a message, ping only once for defensive wars
           const content =
-            isDefense && defensePingRoleId ? `<@&${defensePingRoleId}>` : undefined;
+            isDefense && defensePingRoleId
+              ? `<@&${defensePingRoleId}> New defensive war started!`
+              : undefined;
 
           const msg = await channel.send({
             content,
             embeds: [embed],
+            components,
           });
 
           warMessageMap.set(key, {
@@ -299,10 +552,9 @@ export function startWarAlertsFromEnv(client: Client): void {
             isDefensive: isDefense,
           });
         } else {
-          // Existing war: edit the existing embed, do NOT ping again
           try {
             const msg = await channel.messages.fetch(existing.messageId);
-            await msg.edit({ embeds: [embed] });
+            await msg.edit({ embeds: [embed], components });
           } catch (err) {
             // Message missing or fetch failed; drop reference so it will recreate next poll
             warMessageMap.delete(key);
@@ -314,9 +566,74 @@ export function startWarAlertsFromEnv(client: Client): void {
     }
   }
 
-  // Run immediately once, then every interval
   void pollOnce();
   setInterval(() => {
     void pollOnce();
   }, intervalMs);
+}
+
+export async function handleWarButtonInteraction(
+  interaction: ButtonInteraction,
+): Promise<boolean> {
+  const cid = interaction.customId || "";
+  if (!cid.startsWith("war:")) return false;
+
+  const parts = cid.split(":");
+  const action = parts[1];
+  const warId = parts[2];
+
+  if (action !== "refresh" || !warId) {
+    return false;
+  }
+
+  const { apiKey, allianceId } = getEnv();
+
+  if (!apiKey || !allianceId) {
+    await interaction.reply({
+      content: "War alerts are not configured for this bot.",
+      ephemeral: true,
+    });
+    return true;
+  }
+
+  await interaction.deferUpdate();
+
+  try {
+    const wars = await fetchWars(apiKey);
+    const war = wars.find((w) => w.id === warId);
+    if (!war) {
+      const embed = new EmbedBuilder()
+        .setColor(0x95a5a6)
+        .setTitle(`⚔️ War #${warId}`)
+        .setDescription(
+          "This war is no longer active or could not be found in the latest results.",
+        )
+        .setTimestamp(new Date());
+
+      await interaction.editReply({ embeds: [embed], components: [] });
+      return true;
+    }
+
+    const [attMil, defMil] = await Promise.all([
+      fetchNationMilitary(apiKey, war.att_id),
+      fetchNationMilitary(apiKey, war.def_id),
+    ]);
+
+    const embed = buildWarEmbed(war, allianceId, attMil, defMil);
+    const components = buildComponents(war.id);
+
+    await interaction.editReply({ embeds: [embed], components });
+    return true;
+  } catch (err) {
+    console.error("[war-alerts] refresh button failed", err);
+    try {
+      await interaction.followUp({
+        content: "Failed to refresh war details.",
+        ephemeral: true,
+      });
+    } catch {
+      // ignore
+    }
+    return true;
+  }
 }
