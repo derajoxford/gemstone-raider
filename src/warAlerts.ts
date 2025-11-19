@@ -591,9 +591,10 @@ async function ensureAutoWarRoomForDefense(
   }
 
   // Seed the channel with a basic control message + buttons.
-  // The first "Refresh Dossier + Wars" click will build the full embed + set control_message_id.
+  // Cast to TextChannel so TS is happy.
   try {
-    await channel.send({
+    const textChannel = channel as TextChannel;
+    await textChannel.send({
       content: `🔔 Auto-created war room for **${targetName}** (#${targetNationId}) from defensive war #${war.id}. Use **"Refresh Dossier + Wars"** below to pull live intel.`,
       components: [buildWarRoomControlRow()],
     });
@@ -665,7 +666,7 @@ export function startWarAlertsFromEnv(client: Client): void {
 
   if (!apiKey) {
     console.warn(
-      "[war-alerts] no PNW API key set (PNW_GRAPH_KEY / PNW_API_KEY / PNW_SERVICE_API_KEY / PNW_DEFAULT_API_KEY), cannot start war alerts.",
+      "[war-alerts] no PNW API key set (PNW_GRAPH_KEY / PNW_API_KEY / PNW_SERVICE_API_KEY), cannot start war alerts.",
     );
     return;
   }
@@ -683,7 +684,6 @@ export function startWarAlertsFromEnv(client: Client): void {
     guildId,
     "interval",
     intervalMs,
-    "ms",
   );
 
   async function pollOnce() {
