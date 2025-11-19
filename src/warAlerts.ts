@@ -7,10 +7,12 @@ import {
   ButtonStyle,
   Channel,
   Client,
+  Colors,
   EmbedBuilder,
   TextChannel,
 } from "discord.js";
 import { query } from "./data/db.js";
+import { fetchActiveWars, type WarRecord } from "./pnw/wars.js";
 
 // ---- GraphQL queries ----
 
@@ -143,6 +145,28 @@ interface NationMilitary {
   spies: number | null;
 }
 
+type DossierInfo = {
+  score?: number;
+  cities?: number;
+  soldiers?: number;
+  tanks?: number;
+  aircraft?: number;
+  ships?: number;
+  missiles?: number;
+  nukes?: number;
+  beigeTurns?: number;
+  allianceName?: string;
+};
+
+type WarRoomAutoRow = {
+  created_by_id: string;
+  target_nation_id: number;
+  target_nation_name: string;
+  notes: string | null;
+  member_ids: string[];
+  created_at: Date;
+};
+
 // ---- State ----
 
 const warMessageMap = new Map<string, WarMessageRef>();
@@ -200,6 +224,64 @@ function parseNum(v: any): number | null {
 function formatNum(n: number | null): string {
   if (n === null || Number.isNaN(n)) return "?";
   return n.toLocaleString("en-US");
+}
+
+function ago(iso?: string | null): string {
+  if (!iso) return "";
+  const t = Date.parse(iso);
+  if (Number.isNaN(t)) return "";
+  const ms = Date.now() - t;
+  const d = Math.floor(ms / 86_400_000);
+  const h = Math.floor((ms % 86_400_000) / 3_600_000);
+  if (d > 0) return `${d}d ${h}h ago`;
+  const m = Math.floor((ms % 3_600_000) / 60_000);
+  if (h > 0) return `${h}h ${m}m ago`;
+  const s = Math.floor((ms % 60_000) / 1000);
+  return `${m}m ${s}s ago`;
+}
+
+// ---- REST dossier ----
+
+async function fetchNationDossier(
+  nationId: number,
+): Promise<DossierInfo | null> {
+  const base =
+    (process.env.PNW_API_BASE_REST || "https://politicsandwar.com/api").trim();
+  const key =
+    (process.env.PNW_API_KEY ||
+      process.env.PNW_DEFAULT_API_KEY ||
+      process.env.PNW_SERVICE_API_KEY ||
+      "").trim();
+  if (!key) return null;
+  const url = `${base.replace(
+    /\/+$/,
+    "",
+  )}/nation/id=${nationId}/&key=${encodeURIComponent(key)}`;
+  try {
+    const res = await fetch(url, { headers: { Accept: "application/json" } });
+    if (!res.ok) return null;
+    const d: any = await res.json();
+    if (d?.success === false) return null;
+    const num = (v: any) =>
+      v !== undefined && Number.isFinite(Number(v)) ? Number(v) : undefined;
+    return {
+      score: num(d.score),
+      cities: num(d.cities),
+      soldiers: num(d.soldiers),
+      tanks: num(d.tanks),
+      aircraft: num(d.aircraft),
+      ships: num(d.ships),
+      missiles: num(d.missiles),
+      nukes: num(d.nukes),
+      beigeTurns: num(d.beige_turns_left ?? d.beige_turns),
+      allianceName:
+        typeof d.alliance === "string" && d.alliance !== "0"
+          ? d.alliance
+          : undefined,
+    };
+  } catch {
+    return null;
+  }
 }
 
 // ---- GraphQL calls ----
@@ -317,6 +399,11 @@ function allianceUrl(id: string): string {
   return `https://politicsandwar.com/alliance/id=${id}`;
 }
 
+function nationLink(id: number, name?: string | null) {
+  const safe = name && name.trim().length ? name.trim() : `Nation #${id}`;
+  return `[${safe}](${nationUrl(String(id))})`;
+}
+
 function formatSideBlock(
   war: War,
   side: "ATTACKER" | "DEFENDER",
@@ -383,6 +470,72 @@ function buildComponents(warId: string) {
   );
 
   return [row];
+}
+
+function formatWarsBlock(
+  offense: WarRecord[],
+  defense: WarRecord[],
+): string {
+  const slotLine = `🎯 **Slots:** O ${offense.length}/3 • D ${defense.length}/3`;
+
+  const fmtOff = (w: WarRecord) => {
+    const enemy = w.defender?.nation_name || `#${w.defender_id}`;
+    const started = ago(w.date);
+    const turns = w.turns_left ?? "?";
+    return [
+      `• 💥 vs **${enemy}**`,
+      `   ⏱️ ${started} — ⏳ T${turns}`,
+      `   🔗 [Open War](https://politicsandwar.com/nation/war/status/war=${w.id}) • [Open Nation](https://politicsandwar.com/nation/id=${w.defender_id}) • [Declare](https://politicsandwar.com/nation/war/declare/id=${w.defender_id})`,
+    ].join("\n");
+  };
+  const fmtDef = (w: WarRecord) => {
+    const enemy = w.attacker?.nation_name || `#${w.attacker_id}`;
+    const started = ago(w.date);
+    const turns = w.turns_left ?? "?";
+    return [
+      `• 🛡️ vs **${enemy}**`,
+      `   ⏱️ ${started} — ⏳ T${turns}`,
+      `   🔗 [Open War](https://politicsandwar.com/nation/war/status/war=${w.id}) • [Open Nation](https://politicsandwar.com/nation/id=${w.attacker_id}) • [Declare](https://politicsandwar.com/nation/war/declare/id=${w.attacker_id})`,
+    ].join("\n");
+  };
+
+  const oBlock = offense.length ? offense.map(fmtOff).join("\n\n") : "*None*";
+  const dBlock = defense.length ? defense.map(fmtDef).join("\n\n") : "*None*";
+
+  return [
+    slotLine,
+    "",
+    `🗡️ **Offense**`,
+    oBlock,
+    "",
+    `🛡️ **Defense**`,
+    dBlock,
+  ].join("\n");
+}
+
+function formatDossierBlock(d: DossierInfo | null): string {
+  if (!d) return "No dossier data.";
+  const out: string[] = [];
+  if (d.allianceName) out.push(`🧑‍🤝‍🧑 **Alliance:** ${d.allianceName}`);
+  if (d.score !== undefined) out.push(`📈 **Score:** ${d.score.toFixed(2)}`);
+  if (d.cities !== undefined) out.push(`🏙️ **Cities:** ${d.cities}`);
+
+  const mil: string[] = [];
+  if (d.soldiers !== undefined) mil.push(`🪖 ${d.soldiers.toLocaleString()}`);
+  if (d.tanks !== undefined) mil.push(`🛡️ ${d.tanks.toLocaleString()}`);
+  if (d.aircraft !== undefined) mil.push(`✈️ ${d.aircraft.toLocaleString()}`);
+  if (d.ships !== undefined) mil.push(`🚢 ${d.ships.toLocaleString()}`);
+  if (mil.length) out.push(`⚔️ **Military:** ${mil.join(" • ")}`);
+
+  const boom: string[] = [];
+  if (d.missiles !== undefined) boom.push(`🎯 ${d.missiles}`);
+  if (d.nukes !== undefined) boom.push(`☢️ ${d.nukes}`);
+  if (boom.length) out.push(`💣 **Strategic:** ${boom.join(" • ")}`);
+
+  if (d.beigeTurns !== undefined)
+    out.push(`🟫 **Beige:** ${d.beigeTurns} turns`);
+
+  return out.length ? out.join("\n") : "No dossier data.";
 }
 
 function buildWarEmbed(
@@ -475,6 +628,45 @@ function buildWarRoomControlRow() {
   );
 }
 
+function buildAutoWarRoomEmbed(
+  row: WarRoomAutoRow,
+  dossier: DossierInfo | null,
+  offense: WarRecord[],
+  defense: WarRecord[],
+): EmbedBuilder {
+  const members =
+    row.member_ids.length > 0
+      ? row.member_ids.map((id) => `<@${id}>`).join("\n")
+      : "*none*";
+
+  return new EmbedBuilder()
+    .setColor(Colors.DarkRed)
+    .setTitle(`💥 WAR ROOM — ${row.target_nation_name}`)
+    .setDescription(
+      [
+        `🎯 **Target:** ${nationLink(
+          row.target_nation_id,
+          row.target_nation_name,
+        )}`,
+        `👤 **Created by:** <@${row.created_by_id}>`,
+        "",
+        "⚔️ **Active Wars** (Offense + Defense)",
+        formatWarsBlock(offense, defense),
+        "",
+        "📝 **Notes**",
+        row.notes?.trim() || "*none*",
+        "",
+        "👥 **Members**",
+        members,
+        "",
+        "📊 **Dossier**",
+        formatDossierBlock(dossier),
+      ].join("\n"),
+    )
+    .setFooter({ text: "Gemstone Raider — War Room" })
+    .setTimestamp(row.created_at ?? new Date());
+}
+
 async function ensureAutoWarRoomForDefense(
   client: Client,
   guildId: string,
@@ -560,7 +752,63 @@ async function ensureAutoWarRoomForDefense(
 
   const notes = `Auto-created for defensive war #${war.id}; this nation is being attacked.`;
   const memberIds: string[] = []; // start with no explicit members; buttons can add later
+  const createdAt = new Date();
 
+  // Fetch dossier + wars for initial embed
+  let dossier: DossierInfo | null = null;
+  let offense: WarRecord[] = [];
+  let defense: WarRecord[] = [];
+
+  try {
+    dossier = await fetchNationDossier(targetNationId);
+  } catch (err) {
+    console.error(
+      "[war-alerts] auto war room dossier fetch failed",
+      targetNationId,
+      err,
+    );
+  }
+
+  try {
+    const res = await fetchActiveWars(targetNationId);
+    offense = res.offense;
+    defense = res.defense;
+  } catch (err) {
+    console.error(
+      "[war-alerts] auto war room active wars fetch failed",
+      targetNationId,
+      err,
+    );
+  }
+
+  let controlMsgId: string | null = null;
+
+  // Seed the channel with full control embed + buttons.
+  try {
+    const textChannel = channel as TextChannel;
+    const row: WarRoomAutoRow = {
+      created_by_id: createdById,
+      target_nation_id: targetNationId,
+      target_nation_name: targetName,
+      notes,
+      member_ids: memberIds,
+      created_at: createdAt,
+    };
+    const embed = buildAutoWarRoomEmbed(row, dossier, offense, defense);
+    const msg = await textChannel.send({
+      embeds: [embed],
+      components: [buildWarRoomControlRow()],
+    });
+    controlMsgId = msg.id;
+    await msg.pin().catch(() => {});
+  } catch (err) {
+    console.error(
+      "[war-alerts] failed sending initial auto war room embed",
+      err,
+    );
+  }
+
+  // Insert DB row (even if embed failed, we still want the record)
   try {
     await query(
       `
@@ -572,7 +820,7 @@ async function ensureAutoWarRoomForDefense(
       [
         guild.id,
         channel.id,
-        null, // control_message_id will be set on first Refresh
+        controlMsgId,
         targetName,
         createdById,
         targetNationId,
@@ -585,22 +833,6 @@ async function ensureAutoWarRoomForDefense(
     console.error(
       "[war-alerts] failed inserting auto war room row",
       targetNationId,
-      err,
-    );
-    // Even if DB insert fails, we already created the channel; nothing more to do.
-  }
-
-  // Seed the channel with a basic control message + buttons.
-  // Cast to TextChannel so TS is happy.
-  try {
-    const textChannel = channel as TextChannel;
-    await textChannel.send({
-      content: `🔔 Auto-created war room for **${targetName}** (#${targetNationId}) from defensive war #${war.id}. Use **"Refresh Dossier + Wars"** below to pull live intel.`,
-      components: [buildWarRoomControlRow()],
-    });
-  } catch (err) {
-    console.error(
-      "[war-alerts] failed sending initial auto war room message",
       err,
     );
   }
@@ -625,8 +857,12 @@ function getEnv() {
   ).trim();
   const allianceId = (process.env.WAR_ALERTS_AID || "").trim();
   const guildId = (process.env.WAR_ALERTS_GUILD_ID || "").trim();
-  const offenseChannelId = (process.env.WAR_ALERTS_OFFENSE_CHANNEL_ID || "").trim();
-  const defenseChannelId = (process.env.WAR_ALERTS_DEFENSE_CHANNEL_ID || "").trim();
+  const offenseChannelId = (
+    process.env.WAR_ALERTS_OFFENSE_CHANNEL_ID || ""
+  ).trim();
+  const defenseChannelId = (
+    process.env.WAR_ALERTS_DEFENSE_CHANNEL_ID || ""
+  ).trim();
   const defensePingRoleId =
     (process.env.WAR_ALERTS_DEFENSE_PING_ROLE_ID || "").trim() || undefined;
   const intervalMs = Number(process.env.WAR_ALERTS_INTERVAL_MS || "60000");
@@ -666,7 +902,7 @@ export function startWarAlertsFromEnv(client: Client): void {
 
   if (!apiKey) {
     console.warn(
-      "[war-alerts] no PNW API key set (PNW_GRAPH_KEY / PNW_API_KEY / PNW_SERVICE_API_KEY), cannot start war alerts.",
+      "[war-alerts] no PNW API key set (PNW_GRAPH_KEY / PNW_API_KEY / PNW_SERVICE_API_KEY / PNW_DEFAULT_API_KEY), cannot start war alerts.",
     );
     return;
   }
@@ -693,7 +929,8 @@ export function startWarAlertsFromEnv(client: Client): void {
       const activeWars = wars.filter(
         (w) =>
           w.winner_id === "0" &&
-          (w.att_alliance_id === allianceId || w.def_alliance_id === allianceId),
+          (w.att_alliance_id === allianceId ||
+            w.def_alliance_id === allianceId),
       );
 
       if (activeWars.length === 0) {
