@@ -10,6 +10,7 @@ import {
   EmbedBuilder,
   TextChannel,
 } from "discord.js";
+import { query } from "./data/db.js";
 
 // ---- GraphQL queries ----
 
@@ -450,6 +451,167 @@ function isTextChannel(ch: Channel | null): ch is TextChannel {
   return !!ch && (ch as TextChannel).send !== undefined;
 }
 
+// ---- War Room helpers (auto-open for defensive wars) ----
+
+function buildWarRoomControlRow() {
+  // Must match src/commands/warroom.ts button customIds
+  return new ActionRowBuilder<ButtonBuilder>().addComponents(
+    new ButtonBuilder()
+      .setCustomId("warroom:addMember")
+      .setLabel("Add Member")
+      .setStyle(ButtonStyle.Primary),
+    new ButtonBuilder()
+      .setCustomId("warroom:removeMember")
+      .setLabel("Remove Member")
+      .setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder()
+      .setCustomId("warroom:refreshDossier")
+      .setLabel("Refresh Dossier + Wars")
+      .setStyle(ButtonStyle.Success),
+    new ButtonBuilder()
+      .setCustomId("warroom:close")
+      .setLabel("Close War Room")
+      .setStyle(ButtonStyle.Danger),
+  );
+}
+
+async function ensureAutoWarRoomForDefense(
+  client: Client,
+  guildId: string,
+  war: War,
+): Promise<void> {
+  // War rooms are keyed by the nation being attacked.
+  // For a defensive war, the *defender* (our member) is being attacked.
+  const targetNationId = Number(war.def_id);
+  if (!Number.isFinite(targetNationId) || targetNationId <= 0) return;
+
+  // Check if a war room already exists for this target in this guild.
+  try {
+    const { rows } = await query<{
+      id: string;
+      channel_id: string;
+      target_nation_id: number;
+    }>(
+      `SELECT id, channel_id, target_nation_id
+       FROM war_rooms
+       WHERE guild_id=$1 AND target_nation_id=$2
+       LIMIT 1`,
+      [guildId, targetNationId],
+    );
+
+    if (rows.length > 0) {
+      // Already have a war room for this target; nothing to do.
+      return;
+    }
+  } catch (err) {
+    console.error(
+      "[war-alerts] failed checking existing war room for target",
+      targetNationId,
+      err,
+    );
+    // Don't try to auto-create if we can't verify; be safe.
+    return;
+  }
+
+  const guild = await client.guilds.fetch(guildId).catch(() => null);
+  if (!guild) {
+    console.warn("[war-alerts] guild not found for auto war room", guildId);
+    return;
+  }
+
+  const targetName =
+    war.defender?.nation_name || `Nation #${targetNationId}`;
+
+  const slug = targetName
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "");
+  const channelName = `war-${slug || targetNationId}`;
+
+  const categoryName = process.env.WARROOM_CATEGORY_NAME || "WAR ROOMS";
+
+  // Find or create the WAR ROOMS category (type 4 = Category)
+  let warCat =
+    guild.channels.cache.find(
+      (c: any) =>
+        c.type === 4 &&
+        typeof c.name === "string" &&
+        c.name.toLowerCase() === categoryName.toLowerCase(),
+    ) || null;
+
+  if (!warCat) {
+    warCat = await guild.channels.create({
+      name: categoryName,
+      type: 4,
+      reason: "Gemstone Raider — War Rooms category (auto)",
+    } as any);
+  }
+
+  // Create the war room text channel under the category
+  const channel = await guild.channels.create({
+    name: channelName,
+    parent: (warCat as any).id,
+    topic: `War room for ${targetName} (#${targetNationId}) — auto-created for defensive war #${war.id}`,
+    reason: `War room auto-created by war alerts for defensive war #${war.id}`,
+  } as any);
+
+  const createdById =
+    guild.members.me?.id || client.user?.id || "0";
+
+  const notes = `Auto-created for defensive war #${war.id}; this nation is being attacked.`;
+  const memberIds: string[] = []; // start with no explicit members; buttons can add later
+
+  try {
+    await query(
+      `
+      INSERT INTO war_rooms
+        (guild_id, channel_id, control_message_id, name, created_by_id,
+         target_nation_id, target_nation_name, notes, member_ids)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
+    `,
+      [
+        guild.id,
+        channel.id,
+        null, // control_message_id will be set on first Refresh
+        targetName,
+        createdById,
+        targetNationId,
+        targetName,
+        notes,
+        memberIds,
+      ],
+    );
+  } catch (err) {
+    console.error(
+      "[war-alerts] failed inserting auto war room row",
+      targetNationId,
+      err,
+    );
+    // Even if DB insert fails, we already created the channel; nothing more to do.
+  }
+
+  // Seed the channel with a basic control message + buttons.
+  // The first "Refresh Dossier + Wars" click will build the full embed + set control_message_id.
+  try {
+    await channel.send({
+      content: `🔔 Auto-created war room for **${targetName}** (#${targetNationId}) from defensive war #${war.id}. Use **"Refresh Dossier + Wars"** below to pull live intel.`,
+      components: [buildWarRoomControlRow()],
+    });
+  } catch (err) {
+    console.error(
+      "[war-alerts] failed sending initial auto war room message",
+      err,
+    );
+  }
+
+  console.log(
+    "[war-alerts] auto war room created for target",
+    targetNationId,
+    "war",
+    war.id,
+  );
+}
+
 // ---- env + runner ----
 
 function getEnv() {
@@ -600,6 +762,11 @@ export function startWarAlertsFromEnv(client: Client): void {
             // message missing; recreate next poll
             warMessageMap.delete(key);
           }
+        }
+
+        // Auto-open war room for defensive wars where we are the defender
+        if (isDefense) {
+          await ensureAutoWarRoomForDefense(client, guildId, war);
         }
       }
     } catch (err) {
