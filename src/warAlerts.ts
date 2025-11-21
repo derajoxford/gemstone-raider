@@ -253,10 +253,9 @@ async function fetchNationDossier(
       process.env.PNW_SERVICE_API_KEY ||
       "").trim();
   if (!key) return null;
-  const url = `${base.replace(
-    /\/+$/,
-    "",
-  )}/nation/id=${nationId}/&key=${encodeURIComponent(key)}`;
+  const url = `${base.replace(/\/+$/, "")}/nation/id=${nationId}/&key=${encodeURIComponent(
+    key,
+  )}`;
   try {
     const res = await fetch(url, { headers: { Accept: "application/json" } });
     if (!res.ok) return null;
@@ -472,10 +471,7 @@ function buildComponents(warId: string) {
   return [row];
 }
 
-function formatWarsBlock(
-  offense: WarRecord[],
-  defense: WarRecord[],
-): string {
+function formatWarsBlock(offense: WarRecord[], defense: WarRecord[]): string {
   const slotLine = `🎯 **Slots:** O ${offense.length}/3 • D ${defense.length}/3`;
 
   const fmtOff = (w: WarRecord) => {
@@ -488,6 +484,7 @@ function formatWarsBlock(
       `   🔗 [Open War](https://politicsandwar.com/nation/war/status/war=${w.id}) • [Open Nation](https://politicsandwar.com/nation/id=${w.defender_id}) • [Declare](https://politicsandwar.com/nation/war/declare/id=${w.defender_id})`,
     ].join("\n");
   };
+
   const fmtDef = (w: WarRecord) => {
     const enemy = w.attacker?.nation_name || `#${w.attacker_id}`;
     const started = ago(w.date);
@@ -502,15 +499,9 @@ function formatWarsBlock(
   const oBlock = offense.length ? offense.map(fmtOff).join("\n\n") : "*None*";
   const dBlock = defense.length ? defense.map(fmtDef).join("\n\n") : "*None*";
 
-  return [
-    slotLine,
-    "",
-    `🗡️ **Offense**`,
-    oBlock,
-    "",
-    `🛡️ **Defense**`,
-    dBlock,
-  ].join("\n");
+  return [slotLine, "", `🗡️ **Offense**`, oBlock, "", `🛡️ **Defense**`, dBlock].join(
+    "\n",
+  );
 }
 
 function formatDossierBlock(d: DossierInfo | null): string {
@@ -578,12 +569,12 @@ function buildWarEmbed(
       {
         name: "Attacker",
         value: formatSideBlock(war, "ATTACKER", attMil),
-        inline: false, // stacked
+        inline: false,
       },
       {
         name: "Defender",
         value: formatSideBlock(war, "DEFENDER", defMil),
-        inline: false, // stacked
+        inline: false,
       },
       {
         name: "Our Side",
@@ -607,7 +598,6 @@ function isTextChannel(ch: Channel | null): ch is TextChannel {
 // ---- War Room helpers (auto-open for defensive wars) ----
 
 function buildWarRoomControlRow() {
-  // Must match src/commands/warroom.ts button customIds
   return new ActionRowBuilder<ButtonBuilder>().addComponents(
     new ButtonBuilder()
       .setCustomId("warroom:addMember")
@@ -667,17 +657,43 @@ function buildAutoWarRoomEmbed(
     .setTimestamp(row.created_at ?? new Date());
 }
 
+// Pull Discord IDs for the DEFENDER nation from our existing watchlist table.
+// This is the only accurate mapping Raider has without /link_nation.
+// If nobody is watching that nation, we add nobody (no guesses).
+async function getMemberIdsForDefenderNation(defenderNationId: number): Promise<string[]> {
+  try {
+    const { rows } = await query<{ discord_user_id: string }>(
+      `SELECT discord_user_id
+       FROM watchlist
+       WHERE nation_id=$1`,
+      [defenderNationId],
+    );
+    const ids = rows.map((r) => r.discord_user_id).filter(Boolean);
+    return Array.from(new Set(ids));
+  } catch (err) {
+    console.error(
+      "[war-alerts] failed looking up watchlist members for defender nation",
+      defenderNationId,
+      err,
+    );
+    return [];
+  }
+}
+
 async function ensureAutoWarRoomForDefense(
   client: Client,
   guildId: string,
   war: War,
 ): Promise<void> {
-  // War rooms are keyed by the nation being attacked.
-  // For a defensive war, the *defender* (our member) is being attacked.
-  const targetNationId = Number(war.def_id);
+  // For defensive wars:
+  // - The ENEMY is the attacker (att_id) => that is our TARGET for the room.
+  // - Our member is the defender (def_id) => we try to auto-add their Discord via watchlist.
+  const targetNationId = Number(war.att_id);
+  const defenderNationId = Number(war.def_id);
+
   if (!Number.isFinite(targetNationId) || targetNationId <= 0) return;
 
-  // Check if a war room already exists for this target in this guild.
+  // Check if a war room already exists for this TARGET (enemy attacker) in this guild.
   try {
     const { rows } = await query<{
       id: string;
@@ -692,8 +708,7 @@ async function ensureAutoWarRoomForDefense(
     );
 
     if (rows.length > 0) {
-      // Already have a war room for this target; nothing to do.
-      return;
+      return; // already have it
     }
   } catch (err) {
     console.error(
@@ -701,7 +716,6 @@ async function ensureAutoWarRoomForDefense(
       targetNationId,
       err,
     );
-    // Don't try to auto-create if we can't verify; be safe.
     return;
   }
 
@@ -712,7 +726,11 @@ async function ensureAutoWarRoomForDefense(
   }
 
   const targetName =
-    war.defender?.nation_name || `Nation #${targetNationId}`;
+    war.attacker?.nation_name || `Nation #${targetNationId}`;
+  const defenderName =
+    war.defender?.nation_name || (Number.isFinite(defenderNationId) && defenderNationId > 0
+      ? `Nation #${defenderNationId}`
+      : "Unknown Defender");
 
   const slug = targetName
     .toLowerCase()
@@ -722,7 +740,7 @@ async function ensureAutoWarRoomForDefense(
 
   const categoryName = process.env.WARROOM_CATEGORY_NAME || "WAR ROOMS";
 
-  // Find or create the WAR ROOMS category (type 4 = Category)
+  // Find or create the WAR ROOMS category (type 4 = CategoryChannel)
   let warCat =
     guild.channels.cache.find(
       (c: any) =>
@@ -740,21 +758,43 @@ async function ensureAutoWarRoomForDefense(
   }
 
   // Create the war room text channel under the category
-  const channel = await guild.channels.create({
+  const createdChannel = await guild.channels.create({
     name: channelName,
     parent: (warCat as any).id,
-    topic: `War room for ${targetName} (#${targetNationId}) — auto-created for defensive war #${war.id}`,
+    topic: `War room for ${targetName} (#${targetNationId}) — auto-created from defensive war #${war.id} vs ${defenderName} (#${defenderNationId})`,
     reason: `War room auto-created by war alerts for defensive war #${war.id}`,
   } as any);
+
+  const textChannel = createdChannel as TextChannel;
 
   const createdById =
     guild.members.me?.id || client.user?.id || "0";
 
-  const notes = `Auto-created for defensive war #${war.id}; this nation is being attacked.`;
-  const memberIds: string[] = []; // start with no explicit members; buttons can add later
+  const memberIds =
+    Number.isFinite(defenderNationId) && defenderNationId > 0
+      ? await getMemberIdsForDefenderNation(defenderNationId)
+      : [];
+
+  const notes = [
+    `Auto-created from defensive war #${war.id}.`,
+    `🛡️ **Defending:** ${defenderName} (#${defenderNationId})`,
+    `⚔️ **Enemy:** ${targetName} (#${targetNationId})`,
+  ].join("\n");
+
   const createdAt = new Date();
 
-  // Fetch dossier + wars for initial embed
+  // Give channel perms to auto-added members (best-effort; ignore failures)
+  for (const mid of memberIds) {
+    await textChannel.permissionOverwrites
+      .edit(mid, {
+        ViewChannel: true,
+        SendMessages: true,
+        ReadMessageHistory: true,
+      })
+      .catch(() => {});
+  }
+
+  // Fetch dossier + wars for initial embed (TARGET = enemy)
   let dossier: DossierInfo | null = null;
   let offense: WarRecord[] = [];
   let defense: WarRecord[] = [];
@@ -783,9 +823,7 @@ async function ensureAutoWarRoomForDefense(
 
   let controlMsgId: string | null = null;
 
-  // Seed the channel with full control embed + buttons.
   try {
-    const textChannel = channel as TextChannel;
     const row: WarRoomAutoRow = {
       created_by_id: createdById,
       target_nation_id: targetNationId,
@@ -794,11 +832,16 @@ async function ensureAutoWarRoomForDefense(
       member_ids: memberIds,
       created_at: createdAt,
     };
+
     const embed = buildAutoWarRoomEmbed(row, dossier, offense, defense);
+
     const msg = await textChannel.send({
+      content:
+        memberIds.length > 0 ? memberIds.map((id) => `<@${id}>`).join(" ") : undefined,
       embeds: [embed],
       components: [buildWarRoomControlRow()],
     });
+
     controlMsgId = msg.id;
     await msg.pin().catch(() => {});
   } catch (err) {
@@ -808,7 +851,7 @@ async function ensureAutoWarRoomForDefense(
     );
   }
 
-  // Insert DB row (even if embed failed, we still want the record)
+  // Insert DB row (even if embed failed)
   try {
     await query(
       `
@@ -819,7 +862,7 @@ async function ensureAutoWarRoomForDefense(
     `,
       [
         guild.id,
-        channel.id,
+        textChannel.id,
         controlMsgId,
         targetName,
         createdById,
@@ -920,6 +963,7 @@ export function startWarAlertsFromEnv(client: Client): void {
     guildId,
     "interval",
     intervalMs,
+    "ms",
   );
 
   async function pollOnce() {
@@ -996,12 +1040,11 @@ export function startWarAlertsFromEnv(client: Client): void {
             const msg = await channel.messages.fetch(existing.messageId);
             await msg.edit({ embeds: [embed], components });
           } catch {
-            // message missing; recreate next poll
             warMessageMap.delete(key);
           }
         }
 
-        // Auto-open war room for defensive wars where we are the defender
+        // Auto-open war room for defensive wars
         if (isDefense) {
           await ensureAutoWarRoomForDefense(client, guildId, war);
         }
@@ -1078,9 +1121,7 @@ export async function handleWarButtonInteraction(
         content: "Failed to refresh war details.",
         ephemeral: true,
       });
-    } catch {
-      // ignore
-    }
+    } catch {}
     return true;
   }
 }
