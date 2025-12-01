@@ -12,7 +12,6 @@ type Command = import("../types/command.js").Command;
 function parseNationTarget(raw: string): { id: number; url: string } | null {
   raw = raw.trim();
 
-  // Try to match a PnW nation URL first
   const urlMatch = raw.match(/nation\/id=(\d+)/i);
   if (urlMatch) {
     const id = Number(urlMatch[1]);
@@ -24,7 +23,6 @@ function parseNationTarget(raw: string): { id: number; url: string } | null {
     }
   }
 
-  // Fallback: plain numeric ID
   const id = Number(raw);
   if (Number.isFinite(id) && id > 0) {
     return {
@@ -59,13 +57,11 @@ async function fetchNationNameViaGraphQL(nationId: number): Promise<string | nul
 
     if (!res.ok) return null;
     const j: any = await res.json();
-    return j.data?.nations?.data?.[0]?.nation_name ?? null;
+    return j.data?.nions?.data?.[0]?.nation_name ?? null;
   } catch {
     return null;
   }
 }
-
-// --- command implementation ---
 
 const command: Command = {
   data: new SlashCommandBuilder()
@@ -95,15 +91,13 @@ const command: Command = {
     const userId = interaction.user.id;
     const nationId = parsed.id;
 
-    // Optional: try to fetch a friendly nation name for feedback
     let nationName: string | null = null;
     try {
       nationName = await fetchNationNameViaGraphQL(nationId);
     } catch {
-      // ignore lookup failure; not critical
+      // non-fatal
     }
 
-    // Insert a mapping into watchlist; duplicates are fine and are deduped on read.
     try {
       await query(
         `
@@ -120,7 +114,7 @@ const command: Command = {
       });
       await interaction.editReply({
         content:
-          "❌ Something went wrong saving your registration. Please tell a banker/dev to check the logs.",
+          "❌ Something went wrong saving your registration. Please tell a dev to check the logs.",
       });
       return;
     }
