@@ -558,3 +558,190 @@ async function handleEditNotes(interaction: ButtonInteraction) {
   const modal = new ModalBuilder()
     .setCustomId(`warroom:editNotes:${row.id}`)
     .setTitle("Edit War Room Notes");
+
+  const notesPrefill =
+    (row.notes && row.notes.length > 0
+      ? row.notes.slice(0, 1000)
+      : "") || "";
+
+  const input = new TextInputBuilder()
+    .setCustomId("notes")
+    .setLabel("Notes (visible in war room)")
+    .setStyle(TextInputStyle.Paragraph)
+    .setRequired(false)
+    .setMaxLength(1000)
+    .setValue(notesPrefill);
+
+  modal.addComponents(
+    new ActionRowBuilder<TextInputBuilder>().addComponents(input),
+  );
+
+  await interaction.showModal(modal);
+  return true;
+}
+
+async function handleRefreshDossier(interaction: ButtonInteraction) {
+  const row = await requireRoomFromButton(interaction);
+  if (!row) return true;
+
+  await interaction.deferReply({ ephemeral: true });
+
+  const dossier = await fetchNationDossier(row.target_nation_id);
+  const { offense, defense } = await fetchActiveWars(row.target_nation_id);
+
+  const guild = interaction.guild!;
+  const chan = await guild.channels.fetch(row.channel_id).catch(() => null);
+  if (!chan) {
+    await interaction.editReply({ content: "Missing channel." });
+    return true;
+  }
+
+  let msg =
+    row.control_message_id &&
+    (await (chan as any).messages
+      .fetch(row.control_message_id)
+      .catch(() => null));
+
+  const embed = buildControlEmbed(row, interaction.user, dossier, offense, defense);
+
+  if (!msg) {
+    msg = await (chan as any).send({
+      embeds: [embed],
+      components: [buildControlRow()],
+    });
+    await updateWarRoomControlMessage(row.id, msg.id);
+  } else {
+    await msg.edit({ embeds: [embed], components: [buildControlRow()] });
+  }
+
+  await interaction.editReply({ content: "Refreshed." });
+  return true;
+}
+
+async function handleClose(interaction: ButtonInteraction) {
+  const row = await requireRoomFromButton(interaction);
+  if (!row) return true;
+
+  // Acknowledge first to avoid "Unknown Channel" if deletion succeeds
+  await interaction.reply({ content: "🔒 Closing…", ephemeral: true });
+
+  const guild = interaction.guild!;
+  const chan = await guild.channels.fetch(row.channel_id).catch(() => null);
+
+  if (chan) {
+    await (chan as any).send("🔒 War room closing…").catch(() => {});
+    await chan.delete().catch(() => {});
+  }
+
+  await query(`DELETE FROM war_rooms WHERE id=$1`, [row.id]);
+  return true;
+}
+
+async function handleEditNotesModal(interaction: any) {
+  if (!interaction.isModalSubmit()) return;
+
+  const { guild } = interaction;
+  if (!guild)
+    return interaction.reply({ content: "Guild missing.", ephemeral: true });
+
+  const parts = interaction.customId.split(":");
+  if (parts.length !== 3) return;
+  const [prefix, kind, rowId] = parts;
+  if (prefix !== "warroom" || kind !== "editNotes") return;
+
+  await interaction.deferReply({ ephemeral: true });
+
+  const newNotesRaw = interaction.fields.getTextInputValue("notes") || "";
+  const newNotes = newNotesRaw.trim() || null;
+
+  const row = await getWarRoomById(rowId);
+  if (!row) {
+    await interaction.editReply({ content: "War room record not found." });
+    return;
+  }
+
+  await updateWarRoomNotes(row.id, newNotes);
+
+  const dossier = await fetchNationDossier(row.target_nation_id);
+  const { offense, defense } = await fetchActiveWars(row.target_nation_id);
+
+  const updatedRow: WarRoomRow = { ...row, notes: newNotes };
+
+  const chan = await guild.channels.fetch(updatedRow.channel_id).catch(() => null);
+  if (!chan) {
+    await interaction.editReply({ content: "Missing channel to update embed." });
+    return;
+  }
+
+  let msg =
+    updatedRow.control_message_id &&
+    (await (chan as any).messages
+      .fetch(updatedRow.control_message_id)
+      .catch(() => null));
+
+  const embed = buildControlEmbed(
+    updatedRow,
+    interaction.user,
+    dossier,
+    offense,
+    defense,
+  );
+
+  if (!msg) {
+    msg = await (chan as any).send({
+      embeds: [embed],
+      components: [buildControlRow()],
+    });
+    await updateWarRoomControlMessage(updatedRow.id, msg.id);
+  } else {
+    await msg.edit({ embeds: [embed], components: [buildControlRow()] });
+  }
+
+  await interaction.editReply({ content: "✅ Notes updated." });
+}
+
+// ---------- command ----------
+const command: Command = {
+  data: new SlashCommandBuilder()
+    .setName("warroom")
+    .setDescription("War Room tools")
+    .addSubcommand((sub) =>
+      sub
+        .setName("setup")
+        .setDescription("Create a new war room")
+        .addStringOption((o) =>
+          o.setName("target").setDescription("Nation ID or URL").setRequired(true),
+        )
+        .addUserOption((o) => o.setName("member1").setDescription("Member"))
+        .addUserOption((o) => o.setName("member2").setDescription("Member"))
+        .addUserOption((o) => o.setName("member3").setDescription("Member")),
+    ),
+  async execute(interaction) {
+    const sub = interaction.options.getSubcommand(false);
+    if (sub === "setup" || sub === null) {
+      await handleSetup(interaction);
+      return;
+    }
+    await interaction.reply({ content: "Unknown subcommand.", ephemeral: true });
+  },
+  async handleModal(interaction) {
+    if (!interaction.isModalSubmit()) return;
+    if (interaction.customId.startsWith("warroom:setup:"))
+      await handleSetupModal(interaction);
+    if (interaction.customId.startsWith("warroom:editNotes:"))
+      await handleEditNotesModal(interaction);
+  },
+  async handleButton(interaction) {
+    const id = interaction.customId;
+    if (id === "warroom:addMember") return await handleAddMember(interaction);
+    if (id === "warroom:removeMember") return await handleRemoveMember(interaction);
+    if (id === "warroom:editNotes") return await handleEditNotes(interaction);
+    if (id === "warroom:refreshDossier")
+      return await handleRefreshDossier(interaction);
+    if (id === "warroom:close") return await handleClose(interaction);
+    return false;
+  },
+};
+
+export default command;
+
