@@ -7,11 +7,12 @@ import { query } from "../data/db.js";
 
 type Command = import("../types/command.js").Command;
 
-// --- helpers reused from warroom-style parsing ---
+// --- helpers (same parsing style as warroom) ---
 
 function parseNationTarget(raw: string): { id: number; url: string } | null {
   raw = raw.trim();
 
+  // Try PnW URL first
   const urlMatch = raw.match(/nation\/id=(\d+)/i);
   if (urlMatch) {
     const id = Number(urlMatch[1]);
@@ -23,6 +24,7 @@ function parseNationTarget(raw: string): { id: number; url: string } | null {
     }
   }
 
+  // Fallback: plain numeric ID
   const id = Number(raw);
   if (Number.isFinite(id) && id > 0) {
     return {
@@ -57,11 +59,13 @@ async function fetchNationNameViaGraphQL(nationId: number): Promise<string | nul
 
     if (!res.ok) return null;
     const j: any = await res.json();
-    return j.data?.nions?.data?.[0]?.nation_name ?? null;
+    return j.data?.nations?.data?.[0]?.nation_name ?? null;
   } catch {
     return null;
   }
 }
+
+// --- command ---
 
 const command: Command = {
   data: new SlashCommandBuilder()
