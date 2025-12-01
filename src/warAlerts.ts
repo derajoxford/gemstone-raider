@@ -657,22 +657,24 @@ function buildAutoWarRoomEmbed(
     .setTimestamp(row.created_at ?? new Date());
 }
 
-// Pull Discord IDs for the DEFENDER nation from our existing watchlist table.
-// This is the only accurate mapping Raider has without /link_nation.
-// If nobody is watching that nation, we add nobody (no guesses).
-async function getMemberIdsForDefenderNation(defenderNationId: number): Promise<string[]> {
+// Pull Discord IDs for the DEFENDER nation from user_nation, linked via /link_nation.
+// We only use primary links so we don't accidentally add old mappings.
+async function getMemberIdsForDefenderNation(
+  defenderNationId: number,
+): Promise<string[]> {
   try {
     const { rows } = await query<{ discord_user_id: string }>(
       `SELECT discord_user_id
-       FROM watchlist
-       WHERE nation_id=$1`,
+         FROM user_nation
+         WHERE nation_id = $1
+           AND is_primary = true`,
       [defenderNationId],
     );
     const ids = rows.map((r) => r.discord_user_id).filter(Boolean);
     return Array.from(new Set(ids));
   } catch (err) {
     console.error(
-      "[war-alerts] failed looking up watchlist members for defender nation",
+      "[war-alerts] failed looking up user_nation for defender",
       defenderNationId,
       err,
     );
@@ -687,7 +689,7 @@ async function ensureAutoWarRoomForDefense(
 ): Promise<void> {
   // For defensive wars:
   // - The ENEMY is the attacker (att_id) => that is our TARGET for the room.
-  // - Our member is the defender (def_id) => we try to auto-add their Discord via watchlist.
+  // - Our member is the defender (def_id) => we auto-add their Discord via user_nation (/link_nation).
   const targetNationId = Number(war.att_id);
   const defenderNationId = Number(war.def_id);
 
@@ -728,7 +730,8 @@ async function ensureAutoWarRoomForDefense(
   const targetName =
     war.attacker?.nation_name || `Nation #${targetNationId}`;
   const defenderName =
-    war.defender?.nation_name || (Number.isFinite(defenderNationId) && defenderNationId > 0
+    war.defender?.nation_name ||
+    (Number.isFinite(defenderNationId) && defenderNationId > 0
       ? `Nation #${defenderNationId}`
       : "Unknown Defender");
 
@@ -767,8 +770,7 @@ async function ensureAutoWarRoomForDefense(
 
   const textChannel = createdChannel as TextChannel;
 
-  const createdById =
-    guild.members.me?.id || client.user?.id || "0";
+  const createdById = guild.members.me?.id || client.user?.id || "0";
 
   const memberIds =
     Number.isFinite(defenderNationId) && defenderNationId > 0
@@ -837,7 +839,9 @@ async function ensureAutoWarRoomForDefense(
 
     const msg = await textChannel.send({
       content:
-        memberIds.length > 0 ? memberIds.map((id) => `<@${id}>`).join(" ") : undefined,
+        memberIds.length > 0
+          ? memberIds.map((id) => `<@${id}>`).join(" ")
+          : undefined,
       embeds: [embed],
       components: [buildWarRoomControlRow()],
     });
