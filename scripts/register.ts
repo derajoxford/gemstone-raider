@@ -30,7 +30,7 @@ if (!token || !clientId) {
 }
 
 async function loadCommands() {
-  // We work directly from source: src/commands
+  // Work directly from source: src/commands
   const commandsDir = path.join(__dirname, "..", "src", "commands");
   let files: string[] = [];
   try {
