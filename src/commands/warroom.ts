@@ -216,6 +216,7 @@ function buildControlEmbed(
       [
         `🎯 **Target:** ${nationLink(row.target_nation_id, row.target_nation_name)}`,
         `👤 **Created by:** <@${row.created_by_id}>`,
+        `⚔️ **Wars:** O ${offense.length} • D ${defense.length}`,
         "",
         "⚔️ **Active Wars** (Offense + Defense)",
         formatWarsBlock(offense, defense),
@@ -278,6 +279,13 @@ async function getWarRoomByChannel(
   );
   return rows[0] ?? null;
 }
+async function getWarRoomById(id: string): Promise<WarRoomRow | null> {
+  const { rows } = await query<WarRoomRow>(
+    `SELECT * FROM war_rooms WHERE id=$1 LIMIT 1`,
+    [id],
+  );
+  return rows[0] ?? null;
+}
 async function updateWarRoomMembers(id: string, memberIds: string[]) {
   await query(`UPDATE war_rooms SET member_ids=$2 WHERE id=$1`, [id, memberIds]);
 }
@@ -286,6 +294,9 @@ async function updateWarRoomControlMessage(id: string, msgId: string | null) {
     id,
     msgId,
   ]);
+}
+async function updateWarRoomNotes(id: string, notes: string | null) {
+  await query(`UPDATE war_rooms SET notes=$2 WHERE id=$1`, [id, notes]);
 }
 
 // ---------- command flow ----------
@@ -465,6 +476,10 @@ function buildControlRow() {
       .setLabel("Remove Member")
       .setStyle(ButtonStyle.Secondary),
     new ButtonBuilder()
+      .setCustomId("warroom:editNotes")
+      .setLabel("Edit Notes")
+      .setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder()
       .setCustomId("warroom:refreshDossier")
       .setLabel("Refresh Dossier + Wars")
       .setStyle(ButtonStyle.Success),
@@ -536,100 +551,10 @@ async function handleRemoveMember(interaction: ButtonInteraction) {
   return true;
 }
 
-async function handleRefreshDossier(interaction: ButtonInteraction) {
+async function handleEditNotes(interaction: ButtonInteraction) {
   const row = await requireRoomFromButton(interaction);
   if (!row) return true;
 
-  await interaction.deferReply({ ephemeral: true });
-
-  const dossier = await fetchNationDossier(row.target_nation_id);
-  const { offense, defense } = await fetchActiveWars(row.target_nation_id);
-
-  const guild = interaction.guild!;
-  const chan = await guild.channels.fetch(row.channel_id).catch(() => null);
-  if (!chan) {
-    await interaction.editReply({ content: "Missing channel." });
-    return true;
-  }
-
-  let msg =
-    row.control_message_id &&
-    (await (chan as any).messages
-      .fetch(row.control_message_id)
-      .catch(() => null));
-
-  const embed = buildControlEmbed(row, interaction.user, dossier, offense, defense);
-
-  if (!msg) {
-    msg = await (chan as any).send({
-      embeds: [embed],
-      components: [buildControlRow()],
-    });
-    await updateWarRoomControlMessage(row.id, msg.id);
-  } else {
-    await msg.edit({ embeds: [embed], components: [buildControlRow()] });
-  }
-
-  await interaction.editReply({ content: "Refreshed." });
-  return true;
-}
-
-async function handleClose(interaction: ButtonInteraction) {
-  const row = await requireRoomFromButton(interaction);
-  if (!row) return true;
-
-  // Acknowledge first to avoid "Unknown Channel" if deletion succeeds
-  await interaction.reply({ content: "🔒 Closing…", ephemeral: true });
-
-  const guild = interaction.guild!;
-  const chan = await guild.channels.fetch(row.channel_id).catch(() => null);
-
-  if (chan) {
-    await (chan as any).send("🔒 War room closing…").catch(() => {});
-    await chan.delete().catch(() => {});
-  }
-
-  await query(`DELETE FROM war_rooms WHERE id=$1`, [row.id]);
-  return true;
-}
-
-const command: Command = {
-  data: new SlashCommandBuilder()
-    .setName("warroom")
-    .setDescription("War Room tools")
-    .addSubcommand((sub) =>
-      sub
-        .setName("setup")
-        .setDescription("Create a new war room")
-        .addStringOption((o) =>
-          o.setName("target").setDescription("Nation ID or URL").setRequired(true),
-        )
-        .addUserOption((o) => o.setName("member1").setDescription("Member"))
-        .addUserOption((o) => o.setName("member2").setDescription("Member"))
-        .addUserOption((o) => o.setName("member3").setDescription("Member")),
-    ),
-  async execute(interaction) {
-    const sub = interaction.options.getSubcommand(false);
-    if (sub === "setup" || sub === null) {
-      await handleSetup(interaction);
-      return;
-    }
-    await interaction.reply({ content: "Unknown subcommand.", ephemeral: true });
-  },
-  async handleModal(interaction) {
-    if (!interaction.isModalSubmit()) return;
-    if (interaction.customId.startsWith("warroom:setup:"))
-      await handleSetupModal(interaction);
-  },
-  async handleButton(interaction) {
-    const id = interaction.customId;
-    if (id === "warroom:addMember") return await handleAddMember(interaction);
-    if (id === "warroom:removeMember") return await handleRemoveMember(interaction);
-    if (id === "warroom:refreshDossier")
-      return await handleRefreshDossier(interaction);
-    if (id === "warroom:close") return await handleClose(interaction);
-    return false;
-  },
-};
-
-export default command;
+  const modal = new ModalBuilder()
+    .setCustomId(`warroom:editNotes:${row.id}`)
+    .setTitle("Edit War Room Notes");
