@@ -3,12 +3,12 @@ import "dotenv/config";
 import { REST, Routes } from "discord.js";
 import fs from "node:fs";
 import path from "node:path";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
-// Use same env names you already had, plus a couple fallbacks
+// Use the envs you already had, plus some fallbacks
 const token = (
   process.env.DISCORD_BOT_TOKEN ||
   process.env.DISCORD_TOKEN ||
@@ -30,15 +30,17 @@ if (!token || !clientId) {
 }
 
 async function loadCommands() {
-  // When compiled, this will point at dist/commands
-  const commandsPath = path.join(__dirname, "..", "commands");
+  // We work directly from source: src/commands
+  const commandsDir = path.join(__dirname, "..", "src", "commands");
   let files: string[] = [];
   try {
-    files = fs.readdirSync(commandsPath).filter((f) => f.endsWith(".js"));
+    files = fs
+      .readdirSync(commandsDir)
+      .filter((f) => f.endsWith(".ts") || f.endsWith(".js"));
   } catch (err) {
     console.error(
       "[register] Failed to read commands directory",
-      commandsPath,
+      commandsDir,
       err,
     );
     process.exit(1);
@@ -47,9 +49,9 @@ async function loadCommands() {
   const commands: any[] = [];
 
   for (const file of files) {
-    const full = path.join(commandsPath, file);
+    const fullPath = path.join(commandsDir, file);
     try {
-      const mod = await import(full);
+      const mod = await import(pathToFileURL(fullPath).href);
       const cmd = mod.default || mod.command || mod;
       if (!cmd || !cmd.data || typeof cmd.data.toJSON !== "function") {
         console.log(
