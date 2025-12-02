@@ -53,6 +53,7 @@ async function loadCommands() {
       const url = pathToFileURL(fullPath).href;
       const mod = await import(url);
       const cmd = mod.default || mod.command || mod;
+
       if (!cmd || !cmd.data || typeof cmd.data.toJSON !== "function") {
         console.log(
           "[register] skipping",
@@ -61,6 +62,7 @@ async function loadCommands() {
         );
         continue;
       }
+
       commands.push(cmd.data.toJSON());
       console.log("[register] loaded", cmd.data.name, "from", file);
     } catch (err) {
