@@ -8,7 +8,7 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
-// Token / client / guild come from env
+// Token / client / guild from env
 const token = (
   process.env.DISCORD_BOT_TOKEN ||
   process.env.DISCORD_TOKEN ||
@@ -30,7 +30,6 @@ if (!token || !clientId) {
 }
 
 async function loadCommands() {
-  // Load every command from src/commands (TS or JS)
   const commandsDir = path.join(__dirname, "..", "src", "commands");
   let files: string[] = [];
   try {
