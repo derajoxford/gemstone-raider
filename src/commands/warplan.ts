@@ -246,7 +246,7 @@ async function createTemplateWorkbook(label?: string): Promise<Buffer> {
 function validateHeaderRow(headerRow: ExcelJS.Row): void {
   const problems: string[] = [];
 
-  BLITZ_HEADERS.forEach((expected, index) => {
+  BLITZ_HEADERS.forEach((expected: BlitzHeader, index: number) => {
     const cell = headerRow.getCell(index + 1);
     const raw = cell.value;
     const actual = raw === null || raw === undefined ? "" : String(raw).trim();
@@ -296,11 +296,21 @@ async function parseWarplanWorkbook(arrayBuffer: ArrayBuffer): Promise<ParsedWar
     const nation = nationRaw === null || nationRaw === undefined ? "" : String(nationRaw).trim();
 
     if (!nation) {
-      // Treat completely empty row (no nation) as the end of data.
-      const isEmpty = row.values
-        .slice(1)
-        .every((v) => v === null || v === undefined || String(v).trim().length === 0);
-      if (isEmpty) return;
+      // Check if the whole row (except header) is effectively empty.
+      let hasNonEmpty = false;
+
+      row.eachCell({ includeEmpty: false }, (cell: ExcelJS.Cell, colNumber: number) => {
+        if (colNumber === 1) return;
+        const v = cell.value;
+        if (v !== null && v !== undefined && String(v).trim().length > 0) {
+          hasNonEmpty = true;
+        }
+      });
+
+      if (!hasNonEmpty) {
+        // Entire row is empty → skip
+        return;
+      }
     }
 
     const nationId = parseOptionalInt(row.getCell(2).value);
