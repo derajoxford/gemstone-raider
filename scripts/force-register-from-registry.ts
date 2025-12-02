@@ -1,34 +1,68 @@
 // scripts/force-register-from-registry.ts
 
 import "dotenv/config";
+import fs from "node:fs";
+import path from "node:path";
+import { pathToFileURL } from "node:url";
 import { REST, Routes } from "discord.js";
 
-// NOTE: This assumes pnw-raider uses the same pattern as our other bots:
-// src/commands/index.ts exports a `commandMap` containing all slash commands.
-// If the name is different, we'll tweak this import.
-import { commandMap } from "../src/commands/index.js";
-
-type AnyCommandShape = {
-  data?: { toJSON: () => unknown };
-  builder?: { toJSON: () => unknown };
+type CommandShape = {
+  toJSON?: () => unknown;
 };
 
-function collectCommands(): unknown[] {
-  const raw = (commandMap instanceof Map
-    ? Array.from(commandMap.values())
-    : Object.values(commandMap as Record<string, AnyCommandShape>)) as AnyCommandShape[];
+type CommandModule = {
+  data?: CommandShape;
+  builder?: CommandShape;
+  default?: {
+    data?: CommandShape;
+    builder?: CommandShape;
+  };
+};
 
-  const commands = raw.map((cmd, idx) => {
-    const shape = cmd.data ?? cmd.builder;
-    if (!shape || typeof shape.toJSON !== "function") {
-      throw new Error(
-        `Command at index ${idx} is missing a data/builder.toJSON() shape`,
-      );
+async function loadCommandsFromDist(): Promise<unknown[]> {
+  const commandsDir = path.join(process.cwd(), "dist", "commands");
+
+  if (!fs.existsSync(commandsDir)) {
+    throw new Error(
+      `[register] dist/commands does not exist at ${commandsDir}. Did you run "npm run build"?`,
+    );
+  }
+
+  const files = fs
+    .readdirSync(commandsDir)
+    .filter((f) => f.endsWith(".js"));
+
+  const out: unknown[] = [];
+
+  for (const file of files) {
+    const full = path.join(commandsDir, file);
+    try {
+      const mod = (await import(pathToFileURL(full).href)) as CommandModule;
+
+      const shape: CommandShape | undefined =
+        mod.data ??
+        mod.builder ??
+        mod.default?.data ??
+        mod.default?.builder;
+
+      if (!shape || typeof shape.toJSON !== "function") {
+        console.warn(
+          `[register] Skipping ${file} (no data/builder.toJSON found)`,
+        );
+        continue;
+      }
+
+      out.push(shape.toJSON());
+      console.log(`[register] Loaded command from ${file}`);
+    } catch (err) {
+      console.error(`[register] Error loading ${file}:`, err);
     }
-    return shape.toJSON();
-  });
+  }
 
-  return commands;
+  console.log(
+    `[register] Collected ${out.length} command(s) from dist/commands`,
+  );
+  return out;
 }
 
 async function main() {
@@ -44,17 +78,18 @@ async function main() {
     process.exit(1);
   }
 
+  const commands = await loadCommandsFromDist();
+
   const rest = new REST({ version: "10" }).setToken(token);
 
-  const body = collectCommands();
   console.log(
-    `[register] Pushing ${body.length} commands to guild ${guildId} for app ${clientId}...`,
+    `[register] Pushing ${commands.length} command(s) to guild ${guildId} for app ${clientId}...`,
   );
 
   try {
     await rest.put(
       Routes.applicationGuildCommands(clientId, guildId),
-      { body },
+      { body: commands },
     );
     console.log("[register] Slash commands updated successfully.");
   } catch (err) {
