@@ -1,105 +1,90 @@
 // scripts/force-register-from-registry.ts
-
 import "dotenv/config";
 import fs from "node:fs";
 import path from "node:path";
-import { pathToFileURL } from "node:url";
-import { REST, Routes } from "discord.js";
+import { createRequire } from "node:module";
+import {
+  REST,
+  Routes,
+  type RESTPostAPIChatInputApplicationCommandsJSONBody,
+} from "discord.js";
 
-type CommandShape = {
-  toJSON?: () => unknown;
-};
+const require = createRequire(import.meta.url);
 
-type CommandModule = {
-  data?: CommandShape;
-  builder?: CommandShape;
-  default?: {
-    data?: CommandShape;
-    builder?: CommandShape;
+type CommandFile = {
+  default: {
+    data: {
+      toJSON: () => RESTPostAPIChatInputApplicationCommandsJSONBody;
+      name?: string;
+    };
+    disabled?: boolean;
   };
 };
 
-async function loadCommandsFromDist(): Promise<unknown[]> {
-  const commandsDir = path.join(process.cwd(), "dist", "commands");
+async function main() {
+  const token = process.env.DISCORD_TOKEN;
+  const clientId = process.env.DISCORD_APP_ID ?? process.env.DISCORD_CLIENT_ID;
+  const guildId = process.env.DISCORD_GUILD_ID;
 
-  if (!fs.existsSync(commandsDir)) {
-    throw new Error(
-      `[register] dist/commands does not exist at ${commandsDir}. Did you run "npm run build"?`,
-    );
+  const missing: string[] = [];
+  if (!token) missing.push("DISCORD_TOKEN");
+  if (!clientId) missing.push("DISCORD_APP_ID or DISCORD_CLIENT_ID");
+  if (!guildId) missing.push("DISCORD_GUILD_ID");
+
+  if (missing.length) {
+    console.error("[register] Missing env vars:", missing.join(", "));
+    process.exit(1);
   }
 
-  const files = fs
-    .readdirSync(commandsDir)
-    .filter((f) => f.endsWith(".js"));
+  const commandsPath = path.join(process.cwd(), "dist", "commands");
+  if (!fs.existsSync(commandsPath)) {
+    console.error(
+      "[register] dist/commands does not exist. Did you run `npm run build`?",
+    );
+    process.exit(1);
+  }
 
-  const out: unknown[] = [];
+  const files = fs.readdirSync(commandsPath).filter((f) => f.endsWith(".js"));
+  const body: RESTPostAPIChatInputApplicationCommandsJSONBody[] = [];
 
   for (const file of files) {
-    const full = path.join(commandsDir, file);
     try {
-      const mod = (await import(pathToFileURL(full).href)) as CommandModule;
-
-      const shape: CommandShape | undefined =
-        mod.data ??
-        mod.builder ??
-        mod.default?.data ??
-        mod.default?.builder;
-
-      if (!shape || typeof shape.toJSON !== "function") {
-        console.warn(
-          `[register] Skipping ${file} (no data/builder.toJSON found)`,
-        );
+      const mod: CommandFile = require(path.join(commandsPath, file));
+      const cmd = mod.default;
+      if (!cmd?.data || typeof cmd.data.toJSON !== "function") {
+        console.warn(`[register] Skipping ${file}: no data.toJSON()`);
+        continue;
+      }
+      // optional disabled flag
+      // @ts-ignore runtime-only
+      if (cmd.disabled) {
+        console.log(`[register] Skipping ${file}: disabled`);
         continue;
       }
 
-      out.push(shape.toJSON());
-      console.log(`[register] Loaded command from ${file}`);
+      const json = cmd.data.toJSON();
+      console.log(`[register] Including /${json.name} from ${file}`);
+      body.push(json);
     } catch (err) {
-      console.error(`[register] Error loading ${file}:`, err);
+      console.error(`[register] Failed loading ${file}:`, err);
     }
   }
 
-  console.log(
-    `[register] Collected ${out.length} command(s) from dist/commands`,
-  );
-  return out;
-}
+  console.log(`[register] Registering ${body.length} commands…`);
 
-async function main() {
-  const token = process.env.DISCORD_TOKEN;
-  const clientId = process.env.DISCORD_CLIENT_ID;
-  const guildId = process.env.DISCORD_GUILD_ID;
+  const rest = new REST({ version: "10" }).setToken(token!);
 
-  if (!token || !clientId || !guildId) {
-    console.error("[register] Missing one or more env vars:");
-    console.error("  DISCORD_TOKEN:", token ? "✔" : "✘");
-    console.error("  DISCORD_CLIENT_ID:", clientId ? "✔" : "✘");
-    console.error("  DISCORD_GUILD_ID:", guildId ? "✔" : "✘");
-    process.exit(1);
-  }
-
-  const commands = await loadCommandsFromDist();
-
-  const rest = new REST({ version: "10" }).setToken(token);
-
-  console.log(
-    `[register] Pushing ${commands.length} command(s) to guild ${guildId} for app ${clientId}...`,
+  await rest.put(
+    Routes.applicationGuildCommands(clientId!, guildId!),
+    { body },
   );
 
-  try {
-    await rest.put(
-      Routes.applicationGuildCommands(clientId, guildId),
-      { body: commands },
-    );
-    console.log("[register] Slash commands updated successfully.");
-  } catch (err) {
-    console.error("[register] Failed to update commands:");
-    console.error(err);
-    process.exit(1);
-  }
+  console.log(
+    `[register] Successfully registered ${body.length} commands to guild ${guildId}`,
+  );
 }
 
 main().catch((err) => {
-  console.error("[register] Unhandled error:", err);
+  console.error("[register] Fatal error:", err);
   process.exit(1);
 });
