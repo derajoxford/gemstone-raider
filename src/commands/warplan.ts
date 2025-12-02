@@ -6,7 +6,7 @@ import {
   type CategoryChannel,
   type TextChannel,
 } from "discord.js";
-import ExcelJS from "exceljs";
+import * as ExcelJS from "exceljs";
 
 type TargetRow = {
   rowNumber: number;
@@ -92,12 +92,14 @@ async function parseWarplanAttachment(
   }
 
   const headerMap = new Map<string, number>();
-  headerRow.eachCell((cell, colNumber) => {
-    if (cell.value == null) return;
-    const key = String(cell.value).trim();
-    if (!key) return;
-    headerMap.set(key, colNumber);
-  });
+  headerRow.eachCell(
+    (cell: ExcelJS.Cell, colNumber: number): void => {
+      if (cell.value == null) return;
+      const key = String(cell.value).trim();
+      if (!key) return;
+      headerMap.set(key, colNumber);
+    },
+  );
 
   const missing: string[] = [];
   if (!headerMap.has(HEADER_NATION)) missing.push(HEADER_NATION);
