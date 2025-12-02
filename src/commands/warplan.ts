@@ -1,26 +1,17 @@
+// src/commands/warplan.ts
+
 import {
   SlashCommandBuilder,
   type ChatInputCommandInteraction,
-  type Attachment,
-  ChannelType,
-  type CategoryChannel,
-  type TextChannel,
+  AttachmentBuilder,
+  PermissionFlagsBits,
 } from "discord.js";
-import * as ExcelJS from "exceljs";
+import ExcelJS from "exceljs";
+import { fetch } from "undici";
 
-type TargetRow = {
-  rowNumber: number;
-  nationName: string;
-  nationId: number;
-  attackers: number[];
-};
-
-const HEADER_NATION = "Nation";
-const HEADER_NATION_ID = "NationID";
-const HEADER_ATTACKERS = ["Attacker 1", "Attacker 2", "Attacker 3"];
-
-// Exact header order matching the sample sheet you sent
-const TEMPLATE_HEADERS = [
+// This is the header layout from the Blitz sheet you provided.
+// The template we generate will match this exactly, in order.
+const BLITZ_HEADERS = [
   "Nation",
   "NationID",
   "Alliance",
@@ -42,512 +33,307 @@ const TEMPLATE_HEADERS = [
   "Attacker 1",
   "Attacker 2",
   "Attacker 3",
-];
+] as const;
 
-async function createTemplateWorkbook(label?: string): Promise<Buffer> {
-  const workbook = new ExcelJS.Workbook();
-  const sheetName = label && label.trim().length > 0 ? label.trim() : "Warplan";
-  const sheet = workbook.addWorksheet(sheetName);
+type BlitzHeader = (typeof BLITZ_HEADERS)[number];
 
-  sheet.addRow(TEMPLATE_HEADERS);
-
-  // Make the header row bold
-  const headerRow = sheet.getRow(1);
-  headerRow.font = { bold: true };
-
-  // Autosize-ish columns
-  TEMPLATE_HEADERS.forEach((header, idx) => {
-    const col = sheet.getColumn(idx + 1);
-    col.width = Math.max(12, header.length + 2);
-  });
-
-  const buffer = (await workbook.xlsx.writeBuffer()) as Buffer;
-  return buffer;
+interface ParsedWarRow {
+  nation: string;
+  nationId: number | null;
+  alliance: string | null;
+  attacker1: string | null;
+  attacker2: string | null;
+  attacker3: string | null;
+  rowNumber: number;
 }
 
-async function downloadAttachment(attachment: Attachment): Promise<Buffer> {
-  const res = await fetch(attachment.url);
-  if (!res.ok) {
-    throw new Error(`Failed to download attachment: HTTP ${res.status}`);
-  }
-  const arrayBuffer = await res.arrayBuffer();
-  return Buffer.from(arrayBuffer);
-}
-
-async function parseWarplanAttachment(
-  attachment: Attachment,
-): Promise<{ targets: TargetRow[]; warnings: string[] }> {
-  const buffer = await downloadAttachment(attachment);
-  const workbook = new ExcelJS.Workbook();
-  await workbook.xlsx.load(buffer);
-
-  const sheet = workbook.worksheets[0];
-  if (!sheet) {
-    throw new Error("No worksheet found in the uploaded file.");
-  }
-
-  const headerRow = sheet.getRow(1);
-  if (!headerRow || headerRow.cellCount === 0) {
-    throw new Error("First row appears to be empty. Expected a header row.");
-  }
-
-  const headerMap = new Map<string, number>();
-  headerRow.eachCell(
-    (cell: ExcelJS.Cell, colNumber: number): void => {
-      if (cell.value == null) return;
-      const key = String(cell.value).trim();
-      if (!key) return;
-      headerMap.set(key, colNumber);
-    },
-  );
-
-  const missing: string[] = [];
-  if (!headerMap.has(HEADER_NATION)) missing.push(HEADER_NATION);
-  if (!headerMap.has(HEADER_NATION_ID)) missing.push(HEADER_NATION_ID);
-  if (missing.length > 0) {
-    throw new Error(
-      `Missing required column(s): ${missing.join(
-        ", ",
-      )}. Make sure your header row matches the template exactly.`,
-    );
-  }
-
-  const attackerCols = HEADER_ATTACKERS.map(
-    (h) => headerMap.get(h) ?? null,
-  );
-
-  const nationIdCol = headerMap.get(HEADER_NATION_ID)!;
-  const nationNameCol = headerMap.get(HEADER_NATION)!;
-
-  const targets: TargetRow[] = [];
-  const warnings: string[] = [];
-
-  for (let rowNumber = 2; rowNumber <= sheet.rowCount; rowNumber++) {
-    const row = sheet.getRow(rowNumber);
-    if (!row || row.cellCount === 0) continue;
-
-    const rawNationId = row.getCell(nationIdCol).value;
-    if (rawNationId == null || rawNationId === "") continue;
-
-    const parsedNationId = parseInt(String(rawNationId).trim(), 10);
-    if (!Number.isFinite(parsedNationId)) {
-      warnings.push(
-        `Row ${rowNumber}: invalid NationID (${String(
-          rawNationId,
-        )}). Skipping this row.`,
-      );
-      continue;
-    }
-
-    const rawNationName = row.getCell(nationNameCol).value;
-    const nationName =
-      rawNationName != null && rawNationName !== ""
-        ? String(rawNationName).trim()
-        : `Nation ${parsedNationId}`;
-
-    const attackers: number[] = [];
-    attackerCols.forEach((col, idx) => {
-      if (!col) return;
-      const rawAttacker = row.getCell(col).value;
-      if (rawAttacker == null || rawAttacker === "") return;
-      const parsed = parseInt(String(rawAttacker).trim(), 10);
-      if (Number.isFinite(parsed)) {
-        attackers.push(parsed);
-      } else {
-        warnings.push(
-          `Row ${rowNumber}: invalid value in "${HEADER_ATTACKERS[idx]}" (${String(
-            rawAttacker,
-          )}).`,
-        );
-      }
-    });
-
-    targets.push({
-      rowNumber,
-      nationName,
-      nationId: parsedNationId,
-      attackers,
-    });
-  }
-
-  return { targets, warnings };
-}
-
-function makeChannelName(prefix: string, target: TargetRow): string {
-  const slug = target.nationName
-    .toLowerCase()
-    .replace(/[^a-z0-9]+/g, "-")
-    .replace(/^-+|-+$/g, "");
-  const base = `${prefix}-${target.nationId}`;
-  let name = slug ? `${base}-${slug}` : base;
-  if (name.length > 90) {
-    name = name.slice(0, 90);
-  }
-  return name;
-}
-
-function formatAttackersList(attackers: number[]): string {
-  if (attackers.length === 0) return "_none yet_";
-  return attackers
-    .map((id, idx) => `Fighter ${idx + 1}: Nation ${id}`)
-    .join("\n");
-}
-
-async function handleTemplateSubcommand(
-  interaction: ChatInputCommandInteraction,
-) {
-  const label =
-    interaction.options.getString("label", false) ?? undefined;
-
-  const buffer = await createTemplateWorkbook(label);
-
-  const filenameBase =
-    label && label.trim().length > 0
-      ? label.trim().replace(/\s+/g, "-").toLowerCase()
-      : "warplan-template";
-  const filename = `${filenameBase}.xlsx`;
-
-  await interaction.reply({
-    ephemeral: true,
-    content:
-      "Here is your blank warplan spreadsheet template. Fill it out and use `/warplan import` or `/warplan add_members` when you're ready.",
-    files: [
-      {
-        attachment: buffer,
-        name: filename,
-      },
-    ],
-  });
-}
-
-async function handleImportSubcommand(
-  interaction: ChatInputCommandInteraction,
-) {
-  if (!interaction.guild) {
-    await interaction.reply({
-      ephemeral: true,
-      content: "This command can only be used in a server.",
-    });
-    return;
-  }
-
-  await interaction.deferReply({ ephemeral: true });
-
-  const attachment = interaction.options.getAttachment("file", true);
-  const categoryOption = interaction.options.getChannel(
-    "category",
-    true,
-  );
-  const roomPrefix =
-    interaction.options.getString("room_prefix", false) ?? "war";
-  const addMembersNow =
-    interaction.options.getBoolean("add_members_now", false) ?? false;
-
-  if (!categoryOption || categoryOption.type !== ChannelType.GuildCategory) {
-    await interaction.editReply({
-      content:
-        "The `category` option must be a category channel (where war rooms will be created).",
-    });
-    return;
-  }
-
-  const category = categoryOption as CategoryChannel;
-
-  try {
-    const { targets, warnings } = await parseWarplanAttachment(attachment);
-
-    if (targets.length === 0) {
-      await interaction.editReply({
-        content:
-          "No valid rows found in the sheet. Make sure NationID is filled in for each target.",
-      });
-      return;
-    }
-
-    const guild = interaction.guild;
-    const createdOrUpdated: TextChannel[] = [];
-    const skippedNoChannel: TargetRow[] = [];
-
-    for (const target of targets) {
-      const basePrefix = `${roomPrefix}-${target.nationId}`;
-
-      const existing = guild.channels.cache.find(
-        (ch): ch is TextChannel =>
-          ch.type === ChannelType.GuildText &&
-          ch.parentId === category.id &&
-          ch.name.startsWith(basePrefix),
-      );
-
-      let channel: TextChannel;
-
-      if (existing) {
-        channel = existing;
-      } else {
-        const name = makeChannelName(roomPrefix, target);
-        channel = (await guild.channels.create({
-          name,
-          type: ChannelType.GuildText,
-          parent: category,
-          reason: `Warplan import (row ${target.rowNumber}, nation ${target.nationId})`,
-        })) as TextChannel;
-      }
-
-      createdOrUpdated.push(channel);
-
-      // Basic info message on creation/import
-      await channel.send({
-        content: `War room initialised for **${target.nationName}** (NationID ${target.nationId}) from row ${target.rowNumber} in the warplan sheet.`,
-      });
-
-      if (addMembersNow) {
-        const attackersText = formatAttackersList(target.attackers);
-        await channel.send({
-          content: `Assigned attackers from sheet:\n${attackersText}`,
-        });
-      }
-    }
-
-    let msg = `Processed **${targets.length}** targets from the sheet.\nCreated/updated **${createdOrUpdated.length}** war room channel(s) under **${category.name}**.`;
-
-    if (!addMembersNow) {
-      msg +=
-        "\n\nYou chose not to add members yet. When ready, run `/warplan add_members` with the same sheet to post fighter assignments into the rooms.";
-    }
-
-    if (warnings.length > 0) {
-      const trimmed = warnings.slice(0, 10);
-      msg += `\n\nWarnings (first ${trimmed.length}):\n- ${trimmed.join(
-        "\n- ",
-      )}`;
-      if (warnings.length > trimmed.length) {
-        msg += `\n…and ${warnings.length - trimmed.length} more.`;
-      }
-    }
-
-    await interaction.editReply({ content: msg });
-  } catch (err) {
-    console.error("[warplan import] error", err);
-    await interaction.editReply({
-      content: `Failed to import warplan sheet: ${
-        err instanceof Error ? err.message : String(err)
-      }`,
-    });
-  }
-}
-
-async function handleAddMembersSubcommand(
-  interaction: ChatInputCommandInteraction,
-) {
-  if (!interaction.guild) {
-    await interaction.reply({
-      ephemeral: true,
-      content: "This command can only be used in a server.",
-    });
-    return;
-  }
-
-  await interaction.deferReply({ ephemeral: true });
-
-  const attachment = interaction.options.getAttachment("file", true);
-  const categoryOption = interaction.options.getChannel(
-    "category",
-    true,
-  );
-  const roomPrefix =
-    interaction.options.getString("room_prefix", false) ?? "war";
-
-  if (!categoryOption || categoryOption.type !== ChannelType.GuildCategory) {
-    await interaction.editReply({
-      content:
-        "The `category` option must be a category channel that already contains your war rooms.",
-    });
-    return;
-  }
-
-  const category = categoryOption as CategoryChannel;
-
-  try {
-    const { targets, warnings } = await parseWarplanAttachment(attachment);
-
-    if (targets.length === 0) {
-      await interaction.editReply({
-        content:
-          "No valid rows found in the sheet. Make sure NationID is filled in for each target.",
-      });
-      return;
-    }
-
-    const guild = interaction.guild;
-    let roomsUpdated = 0;
-    const missingChannels: TargetRow[] = [];
-
-    for (const target of targets) {
-      const basePrefix = `${roomPrefix}-${target.nationId}`;
-
-      const channel = guild.channels.cache.find(
-        (ch): ch is TextChannel =>
-          ch.type === ChannelType.GuildText &&
-          ch.parentId === category.id &&
-          ch.name.startsWith(basePrefix),
-      );
-
-      if (!channel) {
-        missingChannels.push(target);
-        continue;
-      }
-
-      const attackersText = formatAttackersList(target.attackers);
-
-      await channel.send({
-        content: `Updated attackers from warplan sheet (row ${target.rowNumber}):\n${attackersText}`,
-      });
-
-      roomsUpdated++;
-    }
-
-    let msg = `Processed **${targets.length}** targets from the sheet.\nUpdated attacker assignments in **${roomsUpdated}** war room(s) under **${category.name}**.`;
-
-    if (missingChannels.length > 0) {
-      const preview = missingChannels.slice(0, 10);
-      msg +=
-        `\n\nCould not find existing channels for **${missingChannels.length}** target(s) (looking for channels named \`${roomPrefix}-<NationID>-...\` in that category). Example missing rows:\n` +
-        preview
-          .map(
-            (t) =>
-              `- Row ${t.rowNumber}: ${t.nationName} (NationID ${t.nationId})`,
-          )
-          .join("\n");
-      if (missingChannels.length > preview.length) {
-        msg += `\n…and ${
-          missingChannels.length - preview.length
-        } more.`;
-      }
-    }
-
-    if (warnings.length > 0) {
-      const trimmed = warnings.slice(0, 10);
-      msg += `\n\nWarnings (first ${trimmed.length}):\n- ${trimmed.join(
-        "\n- ",
-      )}`;
-      if (warnings.length > trimmed.length) {
-        msg += `\n…and ${warnings.length - trimmed.length} more.`;
-      }
-    }
-
-    await interaction.editReply({ content: msg });
-  } catch (err) {
-    console.error("[warplan add_members] error", err);
-    await interaction.editReply({
-      content: `Failed to apply members from warplan sheet: ${
-        err instanceof Error ? err.message : String(err)
-      }`,
-    });
-  }
-}
-
-const data = new SlashCommandBuilder()
+// Slash command definition
+export const builder = new SlashCommandBuilder()
   .setName("warplan")
-  .setDescription("War planning helpers using the alliance XLSX warplan sheet")
+  .setDescription("War planning helper using the Blitz spreadsheet format.")
+  .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild)
   .addSubcommand((sub) =>
     sub
       .setName("template")
-      .setDescription("Download a blank warplan spreadsheet template")
+      .setDescription("Download a blank Blitz warplan sheet.")
       .addStringOption((opt) =>
         opt
           .setName("label")
-          .setDescription("Optional sheet name / label (e.g. 'Blitz vs XYZ')")
+          .setDescription("Optional label for the sheet name / filename.")
           .setRequired(false),
       ),
   )
   .addSubcommand((sub) =>
     sub
       .setName("import")
-      .setDescription(
-        "Import a completed warplan sheet and create war room channels",
-      )
+      .setDescription("Import a filled Blitz warplan sheet (XLSX).")
       .addAttachmentOption((opt) =>
         opt
           .setName("file")
-          .setDescription("Completed warplan .xlsx file")
+          .setDescription("The completed XLSX file you edited.")
           .setRequired(true),
-      )
-      .addChannelOption((opt) =>
-        opt
-          .setName("category")
-          .setDescription("Category where war rooms should be created")
-          .addChannelTypes(ChannelType.GuildCategory)
-          .setRequired(true),
-      )
-      .addStringOption((opt) =>
-        opt
-          .setName("room_prefix")
-          .setDescription(
-            "Prefix for war room channels (default: 'war', rooms are named like war-<NationID>-...)",
-          )
-          .setRequired(false),
       )
       .addBooleanOption((opt) =>
         opt
-          .setName("add_members_now")
+          .setName("preview_only")
           .setDescription(
-            "Also post attacker assignments into the rooms immediately (default: false)",
-          )
-          .setRequired(false),
-      ),
-  )
-  .addSubcommand((sub) =>
-    sub
-      .setName("add_members")
-      .setDescription(
-        "Use a warplan sheet to post attacker assignments into existing war rooms",
-      )
-      .addAttachmentOption((opt) =>
-        opt
-          .setName("file")
-          .setDescription("Warplan .xlsx file (same layout as template)")
-          .setRequired(true),
-      )
-      .addChannelOption((opt) =>
-        opt
-          .setName("category")
-          .setDescription(
-            "Category that already contains the war room channels",
-          )
-          .addChannelTypes(ChannelType.GuildCategory)
-          .setRequired(true),
-      )
-      .addStringOption((opt) =>
-        opt
-          .setName("room_prefix")
-          .setDescription(
-            "Prefix for war room channels (must match what you used for import, default: 'war')",
+            "If true, only show a summary. (War room creation can be wired up later.)",
           )
           .setRequired(false),
       ),
   );
 
-export const command = {
-  data,
-  async execute(interaction: ChatInputCommandInteraction) {
-    const sub = interaction.options.getSubcommand();
+// Main command handler
+export async function run(interaction: ChatInputCommandInteraction) {
+  const sub = interaction.options.getSubcommand(true);
 
-    if (sub === "template") {
-      return handleTemplateSubcommand(interaction);
-    }
-
-    if (sub === "import") {
-      return handleImportSubcommand(interaction);
-    }
-
-    if (sub === "add_members") {
-      return handleAddMembersSubcommand(interaction);
-    }
-
+  if (sub === "template") {
+    await handleTemplate(interaction);
+  } else if (sub === "import") {
+    await handleImport(interaction);
+  } else {
     await interaction.reply({
+      content: "Unknown subcommand for /warplan.",
       ephemeral: true,
-      content: "Unknown subcommand.",
     });
-  },
-};
+  }
+}
 
-export default command;
+/**
+ * /warplan template
+ * Sends an XLSX file that matches the Blitz header layout exactly.
+ */
+async function handleTemplate(interaction: ChatInputCommandInteraction) {
+  await interaction.deferReply({ ephemeral: true });
+
+  const label = interaction.options.getString("label");
+  const workbookBuffer = await createTemplateWorkbook(label ?? undefined);
+
+  const filenameBase = label && label.trim().length > 0 ? label.trim() : "Blitz Warplan";
+  const safeFilenameBase = filenameBase.replace(/[\\/:*?"<>|]+/g, "_");
+
+  const attachment = new AttachmentBuilder(workbookBuffer, {
+    name: `${safeFilenameBase}.xlsx`,
+  });
+
+  await interaction.editReply({
+    content:
+      "Here’s your Blitz warplan template.\nFill in **Attacker 1–3** for each target, then upload it back with `/warplan import`.",
+    files: [attachment],
+  });
+}
+
+/**
+ * /warplan import
+ * Downloads the attachment, parses rows, and shows a summary.
+ * (Right now this is preview-only; we can wire this into war-room creation next.)
+ */
+async function handleImport(interaction: ChatInputCommandInteraction) {
+  const attachment = interaction.options.getAttachment("file", true);
+  const previewOnly = interaction.options.getBoolean("preview_only") ?? false;
+
+  await interaction.deferReply({ ephemeral: true });
+
+  if (!attachment.url.endsWith(".xlsx")) {
+    await interaction.editReply(
+      "The attached file doesn’t look like an `.xlsx` Excel file. Please export the sheet as XLSX and try again.",
+    );
+    return;
+  }
+
+  // Download file via undici
+  const res = await fetch(attachment.url);
+  if (!res.ok) {
+    await interaction.editReply(
+      `I couldn’t download that file from Discord (HTTP ${res.status}). Try re-uploading it.`,
+    );
+    return;
+  }
+
+  const arrayBuffer = await res.arrayBuffer();
+  const parsedRows = await parseWarplanWorkbook(arrayBuffer);
+
+  if (!parsedRows.length) {
+    await interaction.editReply(
+      "I didn’t find any data rows under the header. Make sure you have at least one nation row filled in.",
+    );
+    return;
+  }
+
+  const withAttackers = parsedRows.filter(
+    (row) => row.attacker1 || row.attacker2 || row.attacker3,
+  );
+
+  const lines: string[] = (withAttackers.length ? withAttackers : parsedRows)
+    .slice(0, 25) // Discord message safety
+    .map((row, idx) => {
+      const targetLabel = row.nationId
+        ? `${row.nation} [${row.nationId}]`
+        : row.nation || `Row ${row.rowNumber}`;
+      const attackers = [row.attacker1, row.attacker2, row.attacker3]
+        .filter(Boolean)
+        .join(", ") || "—";
+      const alliance = row.alliance ? ` (${row.alliance})` : "";
+      return `${idx + 1}. **${targetLabel}**${alliance} ← ${attackers}`;
+    });
+
+  const extra = Math.max(0, (withAttackers.length || parsedRows.length) - lines.length);
+
+  let content = "";
+  content += `Parsed **${parsedRows.length}** nation row(s) from the sheet.\n`;
+
+  if (!withAttackers.length) {
+    content +=
+      "\nI didn’t see any attackers filled in yet (Attacker 1–3). I’ll still show the target list below.\n\n";
+  } else {
+    content += `\nI see **${withAttackers.length}** row(s) with at least one attacker assigned.\n\n`;
+  }
+
+  content += lines.join("\n") || "*No rows to display.*";
+  if (extra > 0) {
+    content += `\n… and ${extra} more row(s).`;
+  }
+
+  if (previewOnly) {
+    content +=
+      "\n\nPreview only – no channels or war rooms have been created yet. We can wire that part next.";
+  } else {
+    content +=
+      "\n\nRight now this is **preview-only**. Once we’re happy with the format, we’ll hook this into automatic war-room creation + optional delayed member assignment.";
+  }
+
+  await interaction.editReply({ content });
+}
+
+/**
+ * Build a blank workbook that matches the Blitz header layout.
+ * Returns a Node Buffer suitable for AttachmentBuilder.
+ */
+async function createTemplateWorkbook(label?: string): Promise<Buffer> {
+  const workbook = new ExcelJS.Workbook();
+  const sheetName = label && label.trim().length > 0 ? label.trim() : "Blitz Warplan";
+
+  const sheet = workbook.addWorksheet(sheetName);
+
+  // Header row
+  const headerRow = sheet.addRow([...BLITZ_HEADERS]);
+  headerRow.font = { bold: true };
+
+  // Freeze the header row
+  sheet.views = [{ state: "frozen", ySplit: 1 }];
+
+  // Auto-size columns a bit
+  BLITZ_HEADERS.forEach((header, index) => {
+    const col = sheet.getColumn(index + 1);
+    col.width = Math.max(12, String(header).length + 2);
+  });
+
+  // ExcelJS returns a generic "Buffer" type (ExcelJS.Buffer) which is
+  // ArrayBuffer in browser or Node Buffer in Node. We normalize it to
+  // a Node Buffer here so Discord's AttachmentBuilder is happy.
+  const xlsxData = await workbook.xlsx.writeBuffer();
+  const nodeBuffer = Buffer.isBuffer(xlsxData)
+    ? xlsxData
+    : Buffer.from(xlsxData as ArrayBuffer);
+
+  return nodeBuffer;
+}
+
+/**
+ * Validate that the first row matches the Blitz header layout
+ * (at least for all known columns in correct order).
+ */
+function validateHeaderRow(headerRow: ExcelJS.Row): void {
+  const problems: string[] = [];
+
+  BLITZ_HEADERS.forEach((expected, index) => {
+    const cell = headerRow.getCell(index + 1);
+    const raw = cell.value;
+    const actual = raw === null || raw === undefined ? "" : String(raw).trim();
+
+    if (actual !== expected) {
+      problems.push(
+        `Col ${index + 1}: expected **${expected}** but found **${actual || "(blank)"}**`,
+      );
+    }
+  });
+
+  if (problems.length > 0) {
+    const msg = [
+      "The first row doesn’t match the expected Blitz header format.",
+      "",
+      ...problems,
+    ].join("\n");
+    throw new Error(msg);
+  }
+}
+
+/**
+ * Parse the Blitz workbook from an ArrayBuffer (from undici fetch).
+ */
+async function parseWarplanWorkbook(arrayBuffer: ArrayBuffer): Promise<ParsedWarRow[]> {
+  const workbook = new ExcelJS.Workbook();
+
+  // ExcelJS can load from a Uint8Array; we cast to any to avoid type gymnastics.
+  const data = new Uint8Array(arrayBuffer);
+  await workbook.xlsx.load(data as any);
+
+  const sheet = workbook.worksheets[0];
+  if (!sheet) {
+    throw new Error("Workbook has no worksheets.");
+  }
+
+  const headerRow = sheet.getRow(1);
+  validateHeaderRow(headerRow);
+
+  const results: ParsedWarRow[] = [];
+
+  sheet.eachRow((row: ExcelJS.Row, rowNumber: number) => {
+    if (rowNumber === 1) return; // skip header
+
+    const nationCell = row.getCell(1);
+    const nationRaw = nationCell.value;
+    const nation = nationRaw === null || nationRaw === undefined ? "" : String(nationRaw).trim();
+
+    if (!nation) {
+      // Treat completely empty row (no nation) as the end of data.
+      const isEmpty = row.values
+        .slice(1)
+        .every((v) => v === null || v === undefined || String(v).trim().length === 0);
+      if (isEmpty) return;
+    }
+
+    const nationId = parseOptionalInt(row.getCell(2).value);
+    const alliance = toOptionalString(row.getCell(3).value);
+
+    const attacker1 = toOptionalString(row.getCell(19).value);
+    const attacker2 = toOptionalString(row.getCell(20).value);
+    const attacker3 = toOptionalString(row.getCell(21).value);
+
+    results.push({
+      nation: nation || "",
+      nationId,
+      alliance,
+      attacker1,
+      attacker2,
+      attacker3,
+      rowNumber,
+    });
+  });
+
+  return results;
+}
+
+function parseOptionalInt(value: unknown): number | null {
+  if (value === null || value === undefined) return null;
+  const s = String(value).trim();
+  if (!s) return null;
+  const n = Number(s);
+  return Number.isFinite(n) ? n : null;
+}
+
+function toOptionalString(value: unknown): string | null {
+  if (value === null || value === undefined) return null;
+  const s = String(value).trim();
+  return s.length ? s : null;
+}
