@@ -27,7 +27,7 @@ const execute = async (interaction: ChatInputCommandInteraction) => {
     !interaction.memberPermissions.has(PermissionFlagsBits.ManageGuild)
   ) {
     await interaction.reply({
-      content: "You need the **Manage Server** permission to use this command.",
+      content: "Look hoe,you need the **Manage Server** permission to use this command...and your bitch ass ain't got it",
       ephemeral: true,
     });
     return;
@@ -57,7 +57,7 @@ const execute = async (interaction: ChatInputCommandInteraction) => {
 
   if (rows.length === 0) {
     await interaction.editReply({
-      content: "Nobody is currently registered with Raider (/link_nation).",
+      content: "No hoes are currently registered with Angry Huz (/link_nation).",
     });
     return;
   }
@@ -76,7 +76,7 @@ const execute = async (interaction: ChatInputCommandInteraction) => {
       : "";
 
   await interaction.editReply({
-    content: `**Registered Raider users (primary links):**\n\n${lines.join(
+    content: `**Registered Hoes (primary links):**\n\n${lines.join(
       "\n",
     )}${moreNote}`,
   });
