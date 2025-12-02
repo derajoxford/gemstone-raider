@@ -8,7 +8,7 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
-// Use the envs you already had, plus some fallbacks
+// Token / client / guild come from env
 const token = (
   process.env.DISCORD_BOT_TOKEN ||
   process.env.DISCORD_TOKEN ||
@@ -30,7 +30,7 @@ if (!token || !clientId) {
 }
 
 async function loadCommands() {
-  // Work directly from source: src/commands
+  // Load every command from src/commands (TS or JS)
   const commandsDir = path.join(__dirname, "..", "src", "commands");
   let files: string[] = [];
   try {
@@ -51,7 +51,8 @@ async function loadCommands() {
   for (const file of files) {
     const fullPath = path.join(commandsDir, file);
     try {
-      const mod = await import(pathToFileURL(fullPath).href);
+      const url = pathToFileURL(fullPath).href;
+      const mod = await import(url);
       const cmd = mod.default || mod.command || mod;
       if (!cmd || !cmd.data || typeof cmd.data.toJSON !== "function") {
         console.log(
