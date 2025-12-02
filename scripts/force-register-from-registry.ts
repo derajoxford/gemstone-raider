@@ -1,86 +1,95 @@
 // scripts/force-register-from-registry.ts
 import "dotenv/config";
+import { REST, Routes } from "discord.js";
 import fs from "node:fs";
 import path from "node:path";
 import { createRequire } from "node:module";
-import {
-  REST,
-  Routes,
-  type RESTPostAPIChatInputApplicationCommandsJSONBody,
-} from "discord.js";
 
 const require = createRequire(import.meta.url);
 
-type CommandFile = {
-  default: {
-    data: {
-      toJSON: () => RESTPostAPIChatInputApplicationCommandsJSONBody;
-      name?: string;
-    };
-    disabled?: boolean;
-  };
-};
+const token = process.env.DISCORD_TOKEN;
+const clientId =
+  process.env.DISCORD_CLIENT_ID || process.env.DISCORD_APP_ID || "";
+const guildId = process.env.DISCORD_GUILD_ID || "";
+
+function fail(msg: string): never {
+  console.error("[register] " + msg);
+  process.exit(1);
+}
+
+if (!token || !clientId || !guildId) {
+  console.error("[register] Missing env vars:");
+  console.error(`  DISCORD_TOKEN: ${token ? "✔" : "✘"}`);
+  console.error(`  DISCORD_CLIENT_ID / DISCORD_APP_ID: ${clientId ? "✔" : "✘"}`);
+  console.error(`  DISCORD_GUILD_ID: ${guildId ? "✔" : "✘"}`);
+  process.exit(1);
+}
+
+const rest = new REST({ version: "10" }).setToken(token);
 
 async function main() {
-  const token = process.env.DISCORD_TOKEN;
-  const clientId = process.env.DISCORD_APP_ID ?? process.env.DISCORD_CLIENT_ID;
-  const guildId = process.env.DISCORD_GUILD_ID;
-
-  const missing: string[] = [];
-  if (!token) missing.push("DISCORD_TOKEN");
-  if (!clientId) missing.push("DISCORD_APP_ID or DISCORD_CLIENT_ID");
-  if (!guildId) missing.push("DISCORD_GUILD_ID");
-
-  if (missing.length) {
-    console.error("[register] Missing env vars:", missing.join(", "));
-    process.exit(1);
-  }
-
+  const commands: any[] = [];
   const commandsPath = path.join(process.cwd(), "dist", "commands");
+
   if (!fs.existsSync(commandsPath)) {
-    console.error(
-      "[register] dist/commands does not exist. Did you run `npm run build`?",
-    );
-    process.exit(1);
+    fail("dist/commands not found. Did you run `npm run build`?");
   }
 
-  const files = fs.readdirSync(commandsPath).filter((f) => f.endsWith(".js"));
-  const body: RESTPostAPIChatInputApplicationCommandsJSONBody[] = [];
+  const files = fs
+    .readdirSync(commandsPath)
+    .filter((file) => file.endsWith(".js"));
 
   for (const file of files) {
+    const fullPath = path.join(commandsPath, file);
     try {
-      const mod: CommandFile = require(path.join(commandsPath, file));
-      const cmd = mod.default;
-      if (!cmd?.data || typeof cmd.data.toJSON !== "function") {
-        console.warn(`[register] Skipping ${file}: no data.toJSON()`);
-        continue;
-      }
-      // optional disabled flag
-      // @ts-ignore runtime-only
-      if (cmd.disabled) {
-        console.log(`[register] Skipping ${file}: disabled`);
+      const mod = require(fullPath);
+      const cmd = mod.default ?? mod;
+
+      if (!cmd || !cmd.data) {
+        console.warn(
+          `[register] Skipping ${file}: no data property on default export`,
+        );
         continue;
       }
 
-      const json = cmd.data.toJSON();
+      let json: any;
+
+      // Case 1: SlashCommandBuilder-style (has toJSON)
+      if (typeof cmd.data.toJSON === "function") {
+        json = cmd.data.toJSON();
+      } else if (typeof cmd.data === "object") {
+        // Case 2: Plain object with name/description
+        json = cmd.data;
+      } else {
+        console.warn(
+          `[register] Skipping ${file}: data is not a builder or plain object`,
+        );
+        continue;
+      }
+
+      if (!json || typeof json.name !== "string") {
+        console.warn(
+          `[register] Skipping ${file}: data missing 'name' after normalization`,
+        );
+        continue;
+      }
+
       console.log(`[register] Including /${json.name} from ${file}`);
-      body.push(json);
+      commands.push(json);
     } catch (err) {
-      console.error(`[register] Failed loading ${file}:`, err);
+      console.error(`[register] Error loading ${file}:`, err);
     }
   }
 
-  console.log(`[register] Registering ${body.length} commands…`);
-
-  const rest = new REST({ version: "10" }).setToken(token!);
+  console.log(`[register] Registering ${commands.length} commands…`);
 
   await rest.put(
-    Routes.applicationGuildCommands(clientId!, guildId!),
-    { body },
+    Routes.applicationGuildCommands(clientId, guildId),
+    { body: commands },
   );
 
   console.log(
-    `[register] Successfully registered ${body.length} commands to guild ${guildId}`,
+    `[register] Successfully registered ${commands.length} commands to guild ${guildId}`,
   );
 }
 
