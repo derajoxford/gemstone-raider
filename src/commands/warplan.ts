@@ -902,10 +902,12 @@ async function fetchNationStats(
     apiKey,
   )}`;
 
-  const queryBody = {
+  // Copying the exact style you used in curl:
+  // { nations(id:246232, first:1) { data { ... } } }
+  const body = {
     query: `
-      query ($id: ID!) {
-        nations(id: $id, first: 1) {
+      {
+        nations(id:${id}, first:1) {
           data {
             id
             nation_name
@@ -929,13 +931,12 @@ async function fetchNationStats(
         }
       }
     `,
-    variables: { id: String(id) },
   };
 
   const res = await fetch(url, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(queryBody),
+    body: JSON.stringify(body),
   });
 
   if (!res.ok) {
