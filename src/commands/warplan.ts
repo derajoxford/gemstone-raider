@@ -430,9 +430,6 @@ async function handleImport(interaction: ChatInputCommandInteraction) {
       if (stats.nukes !== null) {
         excelRow.getCell(colIndex("Nukes")).value = stats.nukes;
       }
-      if (stats.spies !== null) {
-        excelRow.getCell(colIndex("Spies")).value = stats.spies;
-      }
 
       excelRow.commit();
     }
@@ -618,7 +615,6 @@ async function handleImport(interaction: ChatInputCommandInteraction) {
       "\n\nMembers have **not** been added yet. When you’re ready, run:\n" +
       `\`/warplan apply_members plan_id:${plan.id}\``;
   } else if (plan && !deferMembers) {
-    // We'll still let apply_members handle the actual member adds, so we just advertise it.
     content +=
       "\n\nUse `/warplan apply_members` to sync attackers into channels once nations are linked.";
   }
@@ -827,7 +823,7 @@ async function loadAndParseWarplanWorkbook(arrayBuffer: ArrayBuffer): Promise<{
     });
   });
 
-  return { workbook, sheet, rows: results };
+  return { workbook, sheet: sheet, rows: results };
 }
 
 function validateHeaderRow(headerRow: ExcelJS.Row): void {
