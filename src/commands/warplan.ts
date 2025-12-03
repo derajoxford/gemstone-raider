@@ -2,9 +2,9 @@
 
 import {
   SlashCommandBuilder,
-  type ChatInputCommandInteraction,
   AttachmentBuilder,
 } from "discord.js";
+import type { ChatInputCommandInteraction } from "discord.js";
 import ExcelJS from "exceljs";
 import { fetch } from "undici";
 
@@ -46,7 +46,7 @@ interface ParsedWarRow {
   rowNumber: number;
 }
 
-// Slash command definition (NO hard permission gate – command_roles will gate it)
+// Slash command builder
 export const data = new SlashCommandBuilder()
   .setName("warplan")
   .setDescription("War planning helper using the Blitz spreadsheet format.")
@@ -75,13 +75,13 @@ export const data = new SlashCommandBuilder()
         opt
           .setName("preview_only")
           .setDescription(
-            "If true, only show a summary. (War room creation can be wired up later.)",
+            "If true, only show a summary. (War room creation will be wired later.)",
           )
           .setRequired(false),
       ),
   );
 
-// Main command handler – this is what your command loader will call
+// Main command handler
 export async function execute(interaction: ChatInputCommandInteraction) {
   const sub = interaction.options.getSubcommand(true);
 
@@ -99,14 +99,13 @@ export async function execute(interaction: ChatInputCommandInteraction) {
 
 /**
  * /warplan template
- * Sends an XLSX file that matches the Blitz header layout exactly,
- * plus a helper row explaining what to fill in (NationID + Attacker IDs).
+ * Sends an XLSX file that matches the Blitz header layout exactly.
  */
 async function handleTemplate(interaction: ChatInputCommandInteraction) {
   await interaction.deferReply({ ephemeral: true });
 
-  const label = interaction.options.getString("label");
-  const workbookBuffer = await createTemplateWorkbook(label ?? undefined);
+  const label = interaction.options.getString("label") ?? undefined;
+  const workbookBuffer = await createTemplateWorkbook(label);
 
   const filenameBase =
     label && label.trim().length > 0 ? label.trim() : "Blitz Warplan";
@@ -119,8 +118,8 @@ async function handleTemplate(interaction: ChatInputCommandInteraction) {
   await interaction.editReply({
     content:
       "Here’s your Blitz warplan template.\n" +
-      "✅ **Required per target:** Nation, NationID, Attacker 1–3 (PnW nation IDs, numbers only)\n" +
-      "Fill it in, then upload it back with `/warplan import`.",
+      "Fill in **Nation / NationID** for each target, and **Attacker 1–3** with **PnW nation IDs** of your fighters.\n" +
+      "Then upload it back with `/warplan import`.",
     files: [attachment],
   });
 }
@@ -128,7 +127,7 @@ async function handleTemplate(interaction: ChatInputCommandInteraction) {
 /**
  * /warplan import
  * Downloads the attachment, parses rows, and shows a summary.
- * (Right now this is preview-only; we can wire this into war-room creation next.)
+ * (Right now this is preview-only; we’ll wire war-room creation next.)
  */
 async function handleImport(interaction: ChatInputCommandInteraction) {
   const attachment = interaction.options.getAttachment("file", true);
@@ -136,9 +135,19 @@ async function handleImport(interaction: ChatInputCommandInteraction) {
 
   await interaction.deferReply({ ephemeral: true });
 
-  if (!attachment.url.endsWith(".xlsx")) {
+  const name = (attachment.name ?? "").toLowerCase();
+  const url = attachment.url.toLowerCase();
+  const urlPath = url.split("?")[0]; // Drop Discord query params
+
+  // Be less dumb: accept based on filename OR URL path
+  const looksLikeXlsx =
+    name.endsWith(".xlsx") || urlPath.endsWith(".xlsx");
+
+  if (!looksLikeXlsx) {
     await interaction.editReply(
-      "The attached file doesn’t look like an `.xlsx` Excel file. Please export the sheet as XLSX and try again.",
+      `The attached file doesn’t look like an \`.xlsx\` Excel file.\n` +
+        `Name I see: \`${attachment.name ?? "unknown"}\`.\n` +
+        `Please export the sheet as **XLSX** and try again.`,
     );
     return;
   }
@@ -153,11 +162,26 @@ async function handleImport(interaction: ChatInputCommandInteraction) {
   }
 
   const arrayBuffer = await res.arrayBuffer();
-  const parsedRows = await parseWarplanWorkbook(arrayBuffer);
+  let parsedRows: ParsedWarRow[];
+  try {
+    parsedRows = await parseWarplanWorkbook(arrayBuffer);
+  } catch (err: any) {
+    const msg = err instanceof Error ? err.message : String(err);
+    await interaction.editReply(
+      "I couldn’t parse that workbook:\n" +
+        "```" +
+        msg.slice(0, 1500) +
+        "```",
+    );
+    return;
+  }
 
   if (!parsedRows.length) {
     await interaction.editReply(
-      "I didn’t find any valid nation rows. Make sure each target has a **NationID** (number) and re-upload.",
+      "I didn’t find any valid data rows.\n\n" +
+        "- `NationID` must be a **number**.\n" +
+        "- Helper row (row 2) is ignored.\n" +
+        "- Empty rows at the bottom are ignored.\n",
     );
     return;
   }
@@ -170,11 +194,12 @@ async function handleImport(interaction: ChatInputCommandInteraction) {
     .slice(0, 25) // Discord message safety
     .map((row, idx) => {
       const targetLabel = row.nationId
-        ? `${row.nation} [${row.nationId}]`
+        ? `${row.nation || "Target"} [${row.nationId}]`
         : row.nation || `Row ${row.rowNumber}`;
       const attackers =
-        [row.attacker1, row.attacker2, row.attacker3].filter(Boolean).join(", ") ||
-        "—";
+        [row.attacker1, row.attacker2, row.attacker3]
+          .filter(Boolean)
+          .join(", ") || "—";
       const alliance = row.alliance ? ` (${row.alliance})` : "";
       return `${idx + 1}. **${targetLabel}**${alliance} ← ${attackers}`;
     });
@@ -185,7 +210,7 @@ async function handleImport(interaction: ChatInputCommandInteraction) {
   );
 
   let content = "";
-  content += `Parsed **${parsedRows.length}** nation row(s) with a valid NationID.\n`;
+  content += `Parsed **${parsedRows.length}** nation row(s) with a numeric **NationID**.\n`;
 
   if (!withAttackers.length) {
     content +=
@@ -201,7 +226,7 @@ async function handleImport(interaction: ChatInputCommandInteraction) {
 
   if (previewOnly) {
     content +=
-      "\n\nPreview only – no channels or war rooms have been created yet. We can wire that part next.";
+      "\n\nPreview only – no channels or war rooms have been created yet. We’ll wire that part next.";
   } else {
     content +=
       "\n\nRight now this is **preview-only**. Once we’re happy with the format, we’ll hook this into automatic war-room creation + optional delayed member assignment.";
@@ -211,9 +236,8 @@ async function handleImport(interaction: ChatInputCommandInteraction) {
 }
 
 /**
- * Build a workbook that matches the Blitz header layout, plus:
- *  - Row 1: Exact Blitz headers
- *  - Row 2: Helper text describing what to fill in (esp. NationID + attackers)
+ * Build a blank workbook that matches the Blitz header layout.
+ * Returns a Node Buffer suitable for AttachmentBuilder.
  */
 async function createTemplateWorkbook(label?: string): Promise<Buffer> {
   const workbook = new ExcelJS.Workbook();
@@ -222,39 +246,36 @@ async function createTemplateWorkbook(label?: string): Promise<Buffer> {
 
   const sheet = workbook.addWorksheet(sheetName);
 
-  // Header row (MUST stay exactly Blitz headers)
+  // Header row (row 1)
   const headerRow = sheet.addRow([...BLITZ_HEADERS]);
   headerRow.font = { bold: true };
 
-  // Helper row under the header explaining required fields / nation IDs
-  const helperValues = BLITZ_HEADERS.map((header): string => {
+  // Helper row (row 2) explaining required fields & IDs
+  const helperValues = BLITZ_HEADERS.map((header) => {
     switch (header) {
       case "Nation":
-        return "REQUIRED → Enemy nation name";
+        return "REQUIRED: Target nation name (for humans)";
       case "NationID":
-        return "REQUIRED → Enemy nation ID (number only, e.g. 246232)";
+        return "REQUIRED: Target PnW nation ID (NUMBER)";
       case "Attacker 1":
-        return "REQUIRED when target is assigned → Your fighter’s nation ID";
       case "Attacker 2":
       case "Attacker 3":
-        return "Optional → Extra fighter nation IDs";
+        return "Optional: attacker PnW nation ID (NUMBER)";
       default:
-        return "Optional / from export (can leave as-is or blank)";
+        return "";
     }
   });
 
   const helperRow = sheet.addRow(helperValues);
-  helperRow.font = { italic: true, color: { argb: "FF666666" } };
+  helperRow.font = { italic: true, size: 10 };
 
-  // Freeze header + helper row
+  // Freeze the top two rows (headers + helper)
   sheet.views = [{ state: "frozen", ySplit: 2 }];
 
-  // Auto-size columns based on header + helper text
+  // Auto-size columns a bit
   BLITZ_HEADERS.forEach((header, index) => {
-    const headerLen = String(header).length;
-    const helperLen = String(helperValues[index] ?? "").length;
     const col = sheet.getColumn(index + 1);
-    col.width = Math.max(12, headerLen + 2, helperLen + 2);
+    col.width = Math.max(12, String(header).length + 2);
   });
 
   // ExcelJS returns a generic "Buffer" type (ExcelJS.Buffer) which is
@@ -265,12 +286,11 @@ async function createTemplateWorkbook(label?: string): Promise<Buffer> {
     ? xlsxData
     : Buffer.from(xlsxData as ArrayBuffer);
 
-  return nodeBuffer as Buffer;
+  return nodeBuffer;
 }
 
 /**
- * Validate that the first row matches the Blitz header layout
- * (at least for all known columns in correct order).
+ * Validate that the first row matches the Blitz header layout.
  */
 function validateHeaderRow(headerRow: ExcelJS.Row): void {
   const problems: string[] = [];
@@ -283,7 +303,9 @@ function validateHeaderRow(headerRow: ExcelJS.Row): void {
 
     if (actual !== expected) {
       problems.push(
-        `Col ${index + 1}: expected **${expected}** but found **${actual || "(blank)"}**`,
+        `Col ${index + 1}: expected **${expected}** but found **${
+          actual || "(blank)"
+        }**`,
       );
     }
   });
@@ -300,7 +322,6 @@ function validateHeaderRow(headerRow: ExcelJS.Row): void {
 
 /**
  * Parse the Blitz workbook from an ArrayBuffer (from undici fetch).
- * Rows MUST have a valid NationID (number) or they are ignored.
  */
 async function parseWarplanWorkbook(
   arrayBuffer: ArrayBuffer,
@@ -322,7 +343,8 @@ async function parseWarplanWorkbook(
   const results: ParsedWarRow[] = [];
 
   sheet.eachRow((row: ExcelJS.Row, rowNumber: number) => {
-    if (rowNumber === 1) return; // skip header row; helper/info rows are filtered below
+    // Row 1 = header, row 2 = helper text → data starts at row 3
+    if (rowNumber <= 2) return;
 
     const nationCell = row.getCell(1);
     const nationRaw = nationCell.value;
@@ -331,25 +353,38 @@ async function parseWarplanWorkbook(
         ? ""
         : String(nationRaw).trim();
 
+    // If Nation is blank, check if the row is effectively empty
+    if (!nation) {
+      let hasNonEmpty = false;
+
+      row.eachCell(
+        { includeEmpty: false },
+        (cell: ExcelJS.Cell, colNumber: number) => {
+          if (colNumber === 1) return;
+          const v = cell.value;
+          if (v !== null && v !== undefined && String(v).trim().length > 0) {
+            hasNonEmpty = true;
+          }
+        },
+      );
+
+      if (!hasNonEmpty) {
+        // Entire row is empty → skip
+        return;
+      }
+    }
+
     const nationId = parseOptionalInt(row.getCell(2).value);
+    if (nationId === null) {
+      // We only care about rows that have a numeric NationID
+      return;
+    }
+
     const alliance = toOptionalString(row.getCell(3).value);
 
     const attacker1 = toOptionalString(row.getCell(19).value);
     const attacker2 = toOptionalString(row.getCell(20).value);
     const attacker3 = toOptionalString(row.getCell(21).value);
-
-    // Ignore any rows that don't have a valid NationID.
-    // This:
-    //  - lets us safely include helper/instruction rows in the template
-    //  - forces your guys to use real PnW nation IDs (no random text-only rows)
-    if (nationId === null) {
-      return;
-    }
-
-    // Also ignore rows that are effectively empty beyond the NationID.
-    if (!nation && !alliance && !attacker1 && !attacker2 && !attacker3) {
-      return;
-    }
 
     results.push({
       nation: nation || "",
@@ -379,5 +414,8 @@ function toOptionalString(value: unknown): string | null {
   return s.length ? s : null;
 }
 
-// This is what the loader & register script expect:
-export default { data, execute };
+// Default export for the command loader / registry
+export default {
+  data,
+  execute,
+};
