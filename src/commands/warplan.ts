@@ -4,7 +4,6 @@ import {
   SlashCommandBuilder,
   type ChatInputCommandInteraction,
   AttachmentBuilder,
-  PermissionFlagsBits,
 } from "discord.js";
 import ExcelJS from "exceljs";
 import { fetch } from "undici";
@@ -47,12 +46,10 @@ interface ParsedWarRow {
   rowNumber: number;
 }
 
-// Slash command definition
-export const builder = new SlashCommandBuilder()
+// Slash command definition (NO hard permission gate – command_roles will gate it)
+export const data = new SlashCommandBuilder()
   .setName("warplan")
   .setDescription("War planning helper using the Blitz spreadsheet format.")
-  // you can remove this if you want roles-only gating; leaving for now
-  .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild)
   .addSubcommand((sub) =>
     sub
       .setName("template")
@@ -84,8 +81,8 @@ export const builder = new SlashCommandBuilder()
       ),
   );
 
-// Main command handler
-export async function run(interaction: ChatInputCommandInteraction) {
+// Main command handler – this is what your command loader will call
+export async function execute(interaction: ChatInputCommandInteraction) {
   const sub = interaction.options.getSubcommand(true);
 
   if (sub === "template") {
@@ -381,3 +378,6 @@ function toOptionalString(value: unknown): string | null {
   const s = String(value).trim();
   return s.length ? s : null;
 }
+
+// This is what the loader & register script expect:
+export default { data, execute };
