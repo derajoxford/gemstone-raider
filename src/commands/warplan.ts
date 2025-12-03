@@ -33,6 +33,7 @@ const BLITZ_HEADERS = [
   "Ships",
   "Missiles",
   "Nukes",
+  "Spies",
   "Attacker 1",
   "Attacker 2",
   "Attacker 3",
@@ -429,6 +430,9 @@ async function handleImport(interaction: ChatInputCommandInteraction) {
       }
       if (stats.nukes !== null) {
         excelRow.getCell(colIndex("Nukes")).value = stats.nukes;
+      }
+      if (stats.spies !== null) {
+        excelRow.getCell(colIndex("Spies")).value = stats.spies;
       }
 
       excelRow.commit();
