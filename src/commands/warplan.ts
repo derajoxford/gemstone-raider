@@ -127,30 +127,14 @@ async function handleTemplate(interaction: ChatInputCommandInteraction) {
 /**
  * /warplan import
  * Downloads the attachment, parses rows, and shows a summary.
- * (Right now this is preview-only; we’ll wire war-room creation next.)
+ * No more bitching about file extensions – we just try to parse and
+ * complain *only* if ExcelJS actually fails.
  */
 async function handleImport(interaction: ChatInputCommandInteraction) {
   const attachment = interaction.options.getAttachment("file", true);
   const previewOnly = interaction.options.getBoolean("preview_only") ?? false;
 
   await interaction.deferReply({ ephemeral: true });
-
-  const name = (attachment.name ?? "").toLowerCase();
-  const url = attachment.url.toLowerCase();
-  const urlPath = url.split("?")[0]; // Drop Discord query params
-
-  // Be less dumb: accept based on filename OR URL path
-  const looksLikeXlsx =
-    name.endsWith(".xlsx") || urlPath.endsWith(".xlsx");
-
-  if (!looksLikeXlsx) {
-    await interaction.editReply(
-      `The attached file doesn’t look like an \`.xlsx\` Excel file.\n` +
-        `Name I see: \`${attachment.name ?? "unknown"}\`.\n` +
-        `Please export the sheet as **XLSX** and try again.`,
-    );
-    return;
-  }
 
   // Download file via undici
   const res = await fetch(attachment.url);
@@ -168,7 +152,8 @@ async function handleImport(interaction: ChatInputCommandInteraction) {
   } catch (err: any) {
     const msg = err instanceof Error ? err.message : String(err);
     await interaction.editReply(
-      "I couldn’t parse that workbook:\n" +
+      "I couldn’t parse that workbook. Make sure it’s an **XLSX** exported from the Blitz sheet.\n" +
+        "Details:\n" +
         "```" +
         msg.slice(0, 1500) +
         "```",
