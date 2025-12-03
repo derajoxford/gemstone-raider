@@ -4,11 +4,9 @@ import {
   SlashCommandBuilder,
   type ChatInputCommandInteraction,
   AttachmentBuilder,
-  PermissionFlagsBits,
 } from "discord.js";
 import ExcelJS from "exceljs";
 import { fetch } from "undici";
-import type { Command } from "../types/command.js";
 
 // This is the header layout from the Blitz sheet you provided.
 // The template we generate will match this exactly, in order.
@@ -48,11 +46,10 @@ interface ParsedWarRow {
   rowNumber: number;
 }
 
-// Slash command definition
-export const builder = new SlashCommandBuilder()
+// Slash command definition (NO hard perm gate – command_roles handles that)
+export const data = new SlashCommandBuilder()
   .setName("warplan")
   .setDescription("War planning helper using the Blitz spreadsheet format.")
-  .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild)
   .addSubcommand((sub) =>
     sub
       .setName("template")
@@ -85,7 +82,7 @@ export const builder = new SlashCommandBuilder()
   );
 
 // Main command handler
-export async function run(interaction: ChatInputCommandInteraction) {
+export async function execute(interaction: ChatInputCommandInteraction) {
   const sub = interaction.options.getSubcommand(true);
 
   if (sub === "template") {
@@ -173,9 +170,8 @@ async function handleImport(interaction: ChatInputCommandInteraction) {
         ? `${row.nation} [${row.nationId}]`
         : row.nation || `Row ${row.rowNumber}`;
       const attackers =
-        [row.attacker1, row.attacker2, row.attacker3]
-          .filter(Boolean)
-          .join(", ") || "—";
+        [row.attacker1, row.attacker2, row.attacker3].filter(Boolean).join(", ") ||
+        "—";
       const alliance = row.alliance ? ` (${row.alliance})` : "";
       return `${idx + 1}. **${targetLabel}**${alliance} ← ${attackers}`;
     });
@@ -235,13 +231,11 @@ async function createTemplateWorkbook(label?: string): Promise<Buffer> {
     col.width = Math.max(12, String(header).length + 2);
   });
 
-  // ExcelJS returns a generic "Buffer" type (ExcelJS.Buffer) which is
-  // ArrayBuffer in browser or Node Buffer in Node. We normalize it to
-  // a Node Buffer here so Discord's AttachmentBuilder is happy.
+  // ExcelJS returns a "Buffer-like" thing; normalize to a real Node Buffer.
   const xlsxData = await workbook.xlsx.writeBuffer();
   const nodeBuffer = Buffer.isBuffer(xlsxData)
     ? xlsxData
-    : Buffer.from(xlsxData as ArrayBuffer);
+    : Buffer.from(xlsxData as any);
 
   return nodeBuffer;
 }
@@ -286,7 +280,7 @@ async function parseWarplanWorkbook(
 ): Promise<ParsedWarRow[]> {
   const workbook = new ExcelJS.Workbook();
 
-  // ExcelJS can load from a Uint8Array; we cast to any to avoid type gymnastics.
+  // ExcelJS can load from a Uint8Array; cast to any to keep TS happy.
   const data = new Uint8Array(arrayBuffer);
   await workbook.xlsx.load(data as any);
 
@@ -370,11 +364,7 @@ function toOptionalString(value: unknown): string | null {
   return s.length ? s : null;
 }
 
-// ---- Default export wiring for bot + registrar ----
-
-const command: Command = {
-  data: builder,
-  execute: run,
+export default {
+  data,
+  execute,
 };
-
-export default command;
