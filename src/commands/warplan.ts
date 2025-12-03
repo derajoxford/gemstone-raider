@@ -4,11 +4,10 @@ import {
   SlashCommandBuilder,
   type ChatInputCommandInteraction,
   AttachmentBuilder,
-  PermissionFlagsBits,
+  PermissionFlagsBits, // (kept in case you want to use later, safe to remove if unused)
 } from "discord.js";
 import ExcelJS from "exceljs";
 import { fetch } from "undici";
-import type { Command } from "../types/command.js";
 
 // This is the header layout from the Blitz sheet you provided.
 // The template we generate will match this exactly, in order.
@@ -52,7 +51,9 @@ interface ParsedWarRow {
 export const builder = new SlashCommandBuilder()
   .setName("warplan")
   .setDescription("War planning helper using the Blitz spreadsheet format.")
-  .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild)
+  // If you decide later you want to hard-gate it to Manage Guild again,
+  // uncomment this:
+  // .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild)
   .addSubcommand((sub) =>
     sub
       .setName("template")
@@ -120,7 +121,8 @@ async function handleTemplate(interaction: ChatInputCommandInteraction) {
 
   await interaction.editReply({
     content:
-      "Here’s your Blitz warplan template.\nFill in **Attacker 1–3** for each target, then upload it back with `/warplan import`.",
+      "Here’s your Blitz warplan template.\n" +
+      "Fill in **Attacker 1–3** for each target, then upload it back with `/warplan import`.",
     files: [attachment],
   });
 }
@@ -132,14 +134,14 @@ async function handleTemplate(interaction: ChatInputCommandInteraction) {
  */
 async function handleImport(interaction: ChatInputCommandInteraction) {
   const attachment = interaction.options.getAttachment("file", true);
-  const previewOnly =
-    interaction.options.getBoolean("preview_only") ?? false;
+  const previewOnly = interaction.options.getBoolean("preview_only") ?? false;
 
   await interaction.deferReply({ ephemeral: true });
 
   if (!attachment.url.endsWith(".xlsx")) {
     await interaction.editReply(
-      "The attached file doesn’t look like an `.xlsx` Excel file. Please export the sheet as XLSX and try again.",
+      "The attached file doesn’t look like an `.xlsx` Excel file. " +
+        "Please export the sheet as XLSX and try again.",
     );
     return;
   }
@@ -148,7 +150,8 @@ async function handleImport(interaction: ChatInputCommandInteraction) {
   const res = await fetch(attachment.url);
   if (!res.ok) {
     await interaction.editReply(
-      `I couldn’t download that file from Discord (HTTP ${res.status}). Try re-uploading it.`,
+      `I couldn’t download that file from Discord (HTTP ${res.status}). ` +
+        "Try re-uploading it.",
     );
     return;
   }
@@ -158,7 +161,8 @@ async function handleImport(interaction: ChatInputCommandInteraction) {
 
   if (!parsedRows.length) {
     await interaction.editReply(
-      "I didn’t find any data rows under the header. Make sure you have at least one nation row filled in.",
+      "I didn’t find any data rows under the header. " +
+        "Make sure you have at least one nation row filled in.",
     );
     return;
   }
@@ -174,9 +178,8 @@ async function handleImport(interaction: ChatInputCommandInteraction) {
         ? `${row.nation} [${row.nationId}]`
         : row.nation || `Row ${row.rowNumber}`;
       const attackers =
-        [row.attacker1, row.attacker2, row.attacker3]
-          .filter(Boolean)
-          .join(", ") || "—";
+        [row.attacker1, row.attacker2, row.attacker3].filter(Boolean).join(", ") ||
+        "—";
       const alliance = row.alliance ? ` (${row.alliance})` : "";
       return `${idx + 1}. **${targetLabel}**${alliance} ← ${attackers}`;
     });
@@ -191,7 +194,8 @@ async function handleImport(interaction: ChatInputCommandInteraction) {
 
   if (!withAttackers.length) {
     content +=
-      "\nI didn’t see any attackers filled in yet (Attacker 1–3). I’ll still show the target list below.\n\n";
+      "\nI didn’t see any attackers filled in yet (Attacker 1–3). " +
+      "I’ll still show the target list below.\n\n";
   } else {
     content += `\nI see **${withAttackers.length}** row(s) with at least one attacker assigned.\n\n`;
   }
@@ -203,10 +207,12 @@ async function handleImport(interaction: ChatInputCommandInteraction) {
 
   if (previewOnly) {
     content +=
-      "\n\nPreview only – no channels or war rooms have been created yet. We can wire that part next.";
+      "\n\nPreview only – no channels or war rooms have been created yet. " +
+      "We can wire that part next.";
   } else {
     content +=
-      "\n\nRight now this is **preview-only**. Once we’re happy with the format, we’ll hook this into automatic war-room creation + optional delayed member assignment.";
+      "\n\nRight now this is **preview-only**. Once we’re happy with the format, " +
+      "we’ll hook this into automatic war-room creation + optional delayed member assignment.";
   }
 
   await interaction.editReply({ content });
@@ -370,11 +376,3 @@ function toOptionalString(value: unknown): string | null {
   const s = String(value).trim();
   return s.length ? s : null;
 }
-
-// 🔻 NEW: wrap this in the Command shape your loader expects
-const command: Command = {
-  data: builder,
-  execute: run,
-};
-
-export default command;
