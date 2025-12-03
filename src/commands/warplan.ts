@@ -4,10 +4,10 @@ import {
   SlashCommandBuilder,
   type ChatInputCommandInteraction,
   AttachmentBuilder,
-  PermissionFlagsBits, // (kept in case you want to use later, safe to remove if unused)
 } from "discord.js";
 import ExcelJS from "exceljs";
 import { fetch } from "undici";
+import type { Command } from "../types/command.js";
 
 // This is the header layout from the Blitz sheet you provided.
 // The template we generate will match this exactly, in order.
@@ -51,9 +51,7 @@ interface ParsedWarRow {
 export const builder = new SlashCommandBuilder()
   .setName("warplan")
   .setDescription("War planning helper using the Blitz spreadsheet format.")
-  // If you decide later you want to hard-gate it to Manage Guild again,
-  // uncomment this:
-  // .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild)
+  // no defaultMemberPermissions hard-gate; actual access is via /command_roles
   .addSubcommand((sub) =>
     sub
       .setName("template")
@@ -140,8 +138,7 @@ async function handleImport(interaction: ChatInputCommandInteraction) {
 
   if (!attachment.url.endsWith(".xlsx")) {
     await interaction.editReply(
-      "The attached file doesn’t look like an `.xlsx` Excel file. " +
-        "Please export the sheet as XLSX and try again.",
+      "The attached file doesn’t look like an `.xlsx` Excel file. Please export the sheet as XLSX and try again.",
     );
     return;
   }
@@ -150,8 +147,7 @@ async function handleImport(interaction: ChatInputCommandInteraction) {
   const res = await fetch(attachment.url);
   if (!res.ok) {
     await interaction.editReply(
-      `I couldn’t download that file from Discord (HTTP ${res.status}). ` +
-        "Try re-uploading it.",
+      `I couldn’t download that file from Discord (HTTP ${res.status}). Try re-uploading it.`,
     );
     return;
   }
@@ -161,8 +157,7 @@ async function handleImport(interaction: ChatInputCommandInteraction) {
 
   if (!parsedRows.length) {
     await interaction.editReply(
-      "I didn’t find any data rows under the header. " +
-        "Make sure you have at least one nation row filled in.",
+      "I didn’t find any data rows under the header. Make sure you have at least one nation row filled in.",
     );
     return;
   }
@@ -242,9 +237,7 @@ async function createTemplateWorkbook(label?: string): Promise<Buffer> {
     col.width = Math.max(12, String(header).length + 2);
   });
 
-  // ExcelJS returns a generic "Buffer" type (ExcelJS.Buffer) which is
-  // ArrayBuffer in browser or Node Buffer in Node. We normalize it to
-  // a Node Buffer here so Discord's AttachmentBuilder is happy.
+  // ExcelJS returns a generic Buffer-like thing. Normalize to Node Buffer.
   const xlsxData = await workbook.xlsx.writeBuffer();
   const nodeBuffer = Buffer.isBuffer(xlsxData)
     ? xlsxData
@@ -293,7 +286,7 @@ async function parseWarplanWorkbook(
 ): Promise<ParsedWarRow[]> {
   const workbook = new ExcelJS.Workbook();
 
-  // ExcelJS can load from a Uint8Array; we cast to any to avoid type gymnastics.
+  // ExcelJS can load from a Uint8Array; cast to any to avoid type gymnastics.
   const data = new Uint8Array(arrayBuffer);
   await workbook.xlsx.load(data as any);
 
@@ -326,11 +319,7 @@ async function parseWarplanWorkbook(
         (cell: ExcelJS.Cell, colNumber: number) => {
           if (colNumber === 1) return;
           const v = cell.value;
-          if (
-            v !== null &&
-            v !== undefined &&
-            String(v).trim().length > 0
-          ) {
+          if (v !== null && v !== undefined && String(v).trim().length > 0) {
             hasNonEmpty = true;
           }
         },
@@ -376,3 +365,13 @@ function toOptionalString(value: unknown): string | null {
   const s = String(value).trim();
   return s.length ? s : null;
 }
+
+// ✅ Wire into the command system
+const command: Command = {
+  data: builder,
+  async execute(interaction: ChatInputCommandInteraction) {
+    await run(interaction);
+  },
+};
+
+export default command;
