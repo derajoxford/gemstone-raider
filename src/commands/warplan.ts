@@ -8,6 +8,7 @@ import {
 } from "discord.js";
 import ExcelJS from "exceljs";
 import { fetch } from "undici";
+import type { Command } from "../types/command.js";
 
 // This is the header layout from the Blitz sheet you provided.
 // The template we generate will match this exactly, in order.
@@ -109,7 +110,8 @@ async function handleTemplate(interaction: ChatInputCommandInteraction) {
   const label = interaction.options.getString("label");
   const workbookBuffer = await createTemplateWorkbook(label ?? undefined);
 
-  const filenameBase = label && label.trim().length > 0 ? label.trim() : "Blitz Warplan";
+  const filenameBase =
+    label && label.trim().length > 0 ? label.trim() : "Blitz Warplan";
   const safeFilenameBase = filenameBase.replace(/[\\/:*?"<>|]+/g, "_");
 
   const attachment = new AttachmentBuilder(workbookBuffer, {
@@ -130,7 +132,8 @@ async function handleTemplate(interaction: ChatInputCommandInteraction) {
  */
 async function handleImport(interaction: ChatInputCommandInteraction) {
   const attachment = interaction.options.getAttachment("file", true);
-  const previewOnly = interaction.options.getBoolean("preview_only") ?? false;
+  const previewOnly =
+    interaction.options.getBoolean("preview_only") ?? false;
 
   await interaction.deferReply({ ephemeral: true });
 
@@ -170,14 +173,18 @@ async function handleImport(interaction: ChatInputCommandInteraction) {
       const targetLabel = row.nationId
         ? `${row.nation} [${row.nationId}]`
         : row.nation || `Row ${row.rowNumber}`;
-      const attackers = [row.attacker1, row.attacker2, row.attacker3]
-        .filter(Boolean)
-        .join(", ") || "—";
+      const attackers =
+        [row.attacker1, row.attacker2, row.attacker3]
+          .filter(Boolean)
+          .join(", ") || "—";
       const alliance = row.alliance ? ` (${row.alliance})` : "";
       return `${idx + 1}. **${targetLabel}**${alliance} ← ${attackers}`;
     });
 
-  const extra = Math.max(0, (withAttackers.length || parsedRows.length) - lines.length);
+  const extra = Math.max(
+    0,
+    (withAttackers.length || parsedRows.length) - lines.length,
+  );
 
   let content = "";
   content += `Parsed **${parsedRows.length}** nation row(s) from the sheet.\n`;
@@ -211,7 +218,8 @@ async function handleImport(interaction: ChatInputCommandInteraction) {
  */
 async function createTemplateWorkbook(label?: string): Promise<Buffer> {
   const workbook = new ExcelJS.Workbook();
-  const sheetName = label && label.trim().length > 0 ? label.trim() : "Blitz Warplan";
+  const sheetName =
+    label && label.trim().length > 0 ? label.trim() : "Blitz Warplan";
 
   const sheet = workbook.addWorksheet(sheetName);
 
@@ -249,11 +257,14 @@ function validateHeaderRow(headerRow: ExcelJS.Row): void {
   BLITZ_HEADERS.forEach((expected: BlitzHeader, index: number) => {
     const cell = headerRow.getCell(index + 1);
     const raw = cell.value;
-    const actual = raw === null || raw === undefined ? "" : String(raw).trim();
+    const actual =
+      raw === null || raw === undefined ? "" : String(raw).trim();
 
     if (actual !== expected) {
       problems.push(
-        `Col ${index + 1}: expected **${expected}** but found **${actual || "(blank)"}**`,
+        `Col ${index + 1}: expected **${expected}** but found **${
+          actual || "(blank)"
+        }**`,
       );
     }
   });
@@ -271,7 +282,9 @@ function validateHeaderRow(headerRow: ExcelJS.Row): void {
 /**
  * Parse the Blitz workbook from an ArrayBuffer (from undici fetch).
  */
-async function parseWarplanWorkbook(arrayBuffer: ArrayBuffer): Promise<ParsedWarRow[]> {
+async function parseWarplanWorkbook(
+  arrayBuffer: ArrayBuffer,
+): Promise<ParsedWarRow[]> {
   const workbook = new ExcelJS.Workbook();
 
   // ExcelJS can load from a Uint8Array; we cast to any to avoid type gymnastics.
@@ -293,19 +306,29 @@ async function parseWarplanWorkbook(arrayBuffer: ArrayBuffer): Promise<ParsedWar
 
     const nationCell = row.getCell(1);
     const nationRaw = nationCell.value;
-    const nation = nationRaw === null || nationRaw === undefined ? "" : String(nationRaw).trim();
+    const nation =
+      nationRaw === null || nationRaw === undefined
+        ? ""
+        : String(nationRaw).trim();
 
     if (!nation) {
       // Check if the whole row (except header) is effectively empty.
       let hasNonEmpty = false;
 
-      row.eachCell({ includeEmpty: false }, (cell: ExcelJS.Cell, colNumber: number) => {
-        if (colNumber === 1) return;
-        const v = cell.value;
-        if (v !== null && v !== undefined && String(v).trim().length > 0) {
-          hasNonEmpty = true;
-        }
-      });
+      row.eachCell(
+        { includeEmpty: false },
+        (cell: ExcelJS.Cell, colNumber: number) => {
+          if (colNumber === 1) return;
+          const v = cell.value;
+          if (
+            v !== null &&
+            v !== undefined &&
+            String(v).trim().length > 0
+          ) {
+            hasNonEmpty = true;
+          }
+        },
+      );
 
       if (!hasNonEmpty) {
         // Entire row is empty → skip
@@ -347,3 +370,11 @@ function toOptionalString(value: unknown): string | null {
   const s = String(value).trim();
   return s.length ? s : null;
 }
+
+// 🔻 NEW: wrap this in the Command shape your loader expects
+const command: Command = {
+  data: builder,
+  execute: run,
+};
+
+export default command;
