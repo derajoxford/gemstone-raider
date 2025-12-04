@@ -8,6 +8,7 @@ import {
   ChannelType,
   type CategoryChannel,
   type TextChannel,
+  EmbedBuilder,
 } from "discord.js";
 import ExcelJS from "exceljs";
 import { fetch } from "undici";
@@ -342,12 +343,15 @@ async function handleImport(interaction: ChatInputCommandInteraction) {
   // Auto-enrich from PnW (stats, wars, etc.)
   // ────────────────────────────────────────────
   const statsById = new Map<number, EnrichedNationStats>();
-  const pnwKey = resolvePnwKey();
+  const { key: pnwKey, source: pnwKeySource } = resolvePnwKey();
+  let debugUniqueIds = 0;
 
   if (autoEnrich && pnwKey) {
     const uniqueIds = Array.from(
       new Set(rowsWithNationId.map((r) => r.nationId!).filter(Boolean)),
     );
+    debugUniqueIds = uniqueIds.length;
+
     for (const id of uniqueIds) {
       try {
         const stats = await fetchNationStats(id, pnwKey);
@@ -438,9 +442,7 @@ async function handleImport(interaction: ChatInputCommandInteraction) {
   // Build Discord preview text
   // ────────────────────────────────────────────
 
-  const withAttackers = parsedRows.filter((row) =>
-    hasAnyAttacker(row),
-  );
+  const withAttackers = parsedRows.filter((row) => hasAnyAttacker(row));
 
   const previewSource =
     withAttackers.length > 0 ? withAttackers : parsedRows;
@@ -487,8 +489,7 @@ async function handleImport(interaction: ChatInputCommandInteraction) {
     for (const row of targetsForRooms) {
       const nationId = row.nationId!;
       const stats = statsById.get(nationId);
-      const nationName =
-        stats?.name || row.nation || `Target ${nationId}`;
+      const nationName = stats?.name || row.nation || `Target ${nationId}`;
       const slug = slugifyName(nationName);
       const baseName = `war-${slug}-${nationId}`;
       const channelName =
@@ -523,17 +524,31 @@ async function handleImport(interaction: ChatInputCommandInteraction) {
         ? attackerNationIds.map((id) => `#${id}`).join(", ")
         : "—";
 
-      let body =
-        `**War Room:** ${nationName} [${nationId}]\n` +
-        `Alliance: **${stats?.allianceName ?? row.alliance ?? "?"}**\n\n`;
+      const fields: { name: string; value: string; inline?: boolean }[] = [];
 
       if (statLines.length) {
-        body += statLines.join("\n") + "\n\n";
+        fields.push({
+          name: "Stats",
+          value: statLines.join("\n"),
+          inline: false,
+        });
       }
 
-      body += `**Assigned attackers (Nation IDs):** ${attackersLabel}\n`;
+      fields.push({
+        name: "Assigned attackers (Nation IDs)",
+        value: attackersLabel,
+        inline: false,
+      });
 
-      const msg = await channel.send(body);
+      const embed = new EmbedBuilder()
+        .setTitle(`War Room: ${nationName} [${nationId}]`)
+        .setDescription(
+          `Alliance: **${stats?.allianceName ?? row.alliance ?? "?"}**`,
+        )
+        .addFields(fields)
+        .setFooter({ text: "Generated via /warplan" });
+
+      const msg = await channel.send({ embeds: [embed] });
       try {
         await msg.pin();
       } catch {
@@ -591,11 +606,15 @@ async function handleImport(interaction: ChatInputCommandInteraction) {
   content += `• Rows with numeric NationID: **${numericRows}**\n`;
   content += `• Rows with at least one attacker: **${attackerRows}**\n`;
 
-  if (autoEnrich && pnwKey) {
-    content += `• Auto-enriched from PnW for **${statsById.size}** nation(s).\n`;
-  } else if (autoEnrich && !pnwKey) {
-    content +=
-      "• Auto-enrich was requested, but no **PnW API key** was found in env (checked PNW_API_KEY, PNW_KEY, PNW_DEFAULT_API_KEY, PNW_SERVICE_API_KEY).\n";
+  if (autoEnrich) {
+    if (pnwKey) {
+      content +=
+        `• Auto-enrich: **yes** (key source: \`${pnwKeySource ?? "unknown"}\`, ` +
+        `target NationIDs: **${debugUniqueIds}**, fetched: **${statsById.size}**)\n`;
+    } else {
+      content +=
+        "• Auto-enrich: **no** (no PnW key found in env; checked `PNW_API_KEY`, `PNW_KEY`, `PNW_DEFAULT_API_KEY`, `PNW_SERVICE_API_KEY`)\n";
+    }
   }
 
   if (createdChannels > 0) {
@@ -665,9 +684,7 @@ async function handleApplyMembers(
 
   // Collect all attacker nation IDs across the plan
   const allAttackerIds = Array.from(
-    new Set(
-      plan.targets.flatMap((t) => t.attackerNationIds),
-    ),
+    new Set(plan.targets.flatMap((t) => t.attackerNationIds)),
   );
   if (!allAttackerIds.length) {
     await interaction.editReply(
@@ -683,9 +700,9 @@ async function handleApplyMembers(
   let totalMembersAdded = 0;
 
   for (const target of plan.targets) {
-    const channel = (await guild.channels.fetch(
-      target.channelId,
-    ).catch(() => null)) as TextChannel | null;
+    const channel = (await guild.channels
+      .fetch(target.channelId)
+      .catch(() => null)) as TextChannel | null;
     if (!channel) continue;
 
     totalChannelsTouched++;
@@ -889,27 +906,26 @@ function parseAttackerNationIds(row: ParsedWarRow): number[] {
   return out;
 }
 
-function resolvePnwKey(): string | null {
-  const names = [
-    "PNW_API_KEY",
-    "PNW_KEY",
-    "PNW_DEFAULT_API_KEY",
-    "PNW_SERVICE_API_KEY",
-  ] as const;
+function resolvePnwKey(): { key: string | null; source: string | null } {
+  const candidates: [string, string | undefined][] = [
+    ["PNW_API_KEY", process.env.PNW_API_KEY],
+    ["PNW_KEY", process.env.PNW_KEY],
+    ["PNW_DEFAULT_API_KEY", process.env.PNW_DEFAULT_API_KEY],
+    ["PNW_SERVICE_API_KEY", process.env.PNW_SERVICE_API_KEY],
+  ];
 
-  for (const name of names) {
-    const raw = process.env[name];
+  for (const [name, raw] of candidates) {
     if (raw && raw.trim().length > 0) {
       const val = raw.trim();
       console.log("[warplan] using", name, "for auto-enrich");
-      return val;
+      return { key: val, source: name };
     }
   }
 
   console.warn(
     "[warplan] No PnW key found. Checked PNW_API_KEY, PNW_KEY, PNW_DEFAULT_API_KEY, PNW_SERVICE_API_KEY.",
   );
-  return null;
+  return { key: null, source: null };
 }
 
 async function fetchNationStats(
@@ -1012,11 +1028,13 @@ async function fetchNationStats(
 }
 
 function slugifyName(name: string): string {
-  return name
-    .toLowerCase()
-    .replace(/[^a-z0-9]+/g, "-")
-    .replace(/^-+|-+$/g, "")
-    .slice(0, 50) || "target";
+  return (
+    name
+      .toLowerCase()
+      .replace(/[^a-z0-9]+/g, "-")
+      .replace(/^-+|-+$/g, "")
+      .slice(0, 50) || "target"
+  );
 }
 
 async function ensureWarCategory(
