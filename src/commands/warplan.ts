@@ -342,12 +342,7 @@ async function handleImport(interaction: ChatInputCommandInteraction) {
   // Auto-enrich from PnW (stats, wars, etc.)
   // ────────────────────────────────────────────
   const statsById = new Map<number, EnrichedNationStats>();
-  const pnwKey =
-    process.env.PNW_API_KEY && process.env.PNW_API_KEY.trim().length > 0
-      ? process.env.PNW_API_KEY.trim()
-      : process.env.PNW_KEY && process.env.PNW_KEY.trim().length > 0
-        ? process.env.PNW_KEY.trim()
-        : null;
+  const pnwKey = resolvePnwKey();
 
   if (autoEnrich && pnwKey) {
     const uniqueIds = Array.from(
@@ -435,7 +430,7 @@ async function handleImport(interaction: ChatInputCommandInteraction) {
     }
   } else if (autoEnrich && !pnwKey) {
     console.warn(
-      "[warplan] auto_enrich requested but no PNW_API_KEY / PNW_KEY env set.",
+      "[warplan] auto_enrich requested but no PnW key found (checked PNW_API_KEY, PNW_KEY, PNW_DEFAULT_API_KEY, PNW_SERVICE_API_KEY).",
     );
   }
 
@@ -600,7 +595,7 @@ async function handleImport(interaction: ChatInputCommandInteraction) {
     content += `• Auto-enriched from PnW for **${statsById.size}** nation(s).\n`;
   } else if (autoEnrich && !pnwKey) {
     content +=
-      "• Auto-enrich was requested, but no **PNW_API_KEY / PNW_KEY** env was set. All non-required columns are left as-is.\n";
+      "• Auto-enrich was requested, but no **PnW API key** was found in env (checked PNW_API_KEY, PNW_KEY, PNW_DEFAULT_API_KEY, PNW_SERVICE_API_KEY).\n";
   }
 
   if (createdChannels > 0) {
@@ -894,6 +889,29 @@ function parseAttackerNationIds(row: ParsedWarRow): number[] {
   return out;
 }
 
+function resolvePnwKey(): string | null {
+  const names = [
+    "PNW_API_KEY",
+    "PNW_KEY",
+    "PNW_DEFAULT_API_KEY",
+    "PNW_SERVICE_API_KEY",
+  ] as const;
+
+  for (const name of names) {
+    const raw = process.env[name];
+    if (raw && raw.trim().length > 0) {
+      const val = raw.trim();
+      console.log("[warplan] using", name, "for auto-enrich");
+      return val;
+    }
+  }
+
+  console.warn(
+    "[warplan] No PnW key found. Checked PNW_API_KEY, PNW_KEY, PNW_DEFAULT_API_KEY, PNW_SERVICE_API_KEY.",
+  );
+  return null;
+}
+
 async function fetchNationStats(
   id: number,
   apiKey: string,
@@ -902,12 +920,10 @@ async function fetchNationStats(
     apiKey,
   )}`;
 
-  // Copying the exact style you used in curl:
-  // { nations(id:246232, first:1) { data { ... } } }
-  const body = {
+  const queryBody = {
     query: `
-      {
-        nations(id:${id}, first:1) {
+      query ($id: ID!) {
+        nations(id: $id, first: 1) {
           data {
             id
             nation_name
@@ -931,12 +947,13 @@ async function fetchNationStats(
         }
       }
     `,
+    variables: { id: String(id) },
   };
 
   const res = await fetch(url, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(body),
+    body: JSON.stringify(queryBody),
   });
 
   if (!res.ok) {
