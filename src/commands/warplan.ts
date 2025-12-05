@@ -8,16 +8,9 @@ import {
   ChannelType,
   type CategoryChannel,
   type TextChannel,
-  EmbedBuilder,
-  ActionRowBuilder,
-  ButtonBuilder,
-  ButtonStyle,
-  Colors,
-  type User,
 } from "discord.js";
 import ExcelJS from "exceljs";
 import { fetch } from "undici";
-import { fetchActiveWars, type WarRecord } from "../pnw/wars.js";
 import type { Command } from "../types/command.js";
 import { query } from "../data/db.js";
 
@@ -93,37 +86,41 @@ interface WarplanPlan {
   targets: WarplanTarget[];
 }
 
-// War room DB row — mirror of warroom.ts
-interface WarRoomRow {
-  id: string;
-  guild_id: string;
-  channel_id: string;
-  control_message_id: string | null;
-  name: string;
-  created_by_id: string;
-  target_nation_id: number;
-  target_nation_name: string;
-  notes: string | null;
-  member_ids: string[];
-  created_at: Date;
-}
-
-interface DossierInfo {
-  score?: number;
-  cities?: number;
-  soldiers?: number;
-  tanks?: number;
-  aircraft?: number;
-  ships?: number;
-  missiles?: number;
-  nukes?: number;
-  beigeTurns?: number;
-  allianceName?: string;
-}
-
 const WAR_CATEGORY_NAME = "WAR ROOMS";
 const warplanPlans = new Map<number, WarplanPlan>();
 let nextPlanId = 1;
+
+// Small helpers reused in multiple places
+const colIndex = (header: BlitzHeader): number =>
+  BLITZ_HEADERS.indexOf(header) + 1;
+
+function resolvePnwKey(): string | null {
+  const candidates = [
+    process.env.PNW_API_KEY,
+    process.env.PNW_DEFAULT_API_KEY,
+    process.env.PNW_SERVICE_API_KEY,
+    process.env.PNW_KEY,
+  ];
+  for (const raw of candidates) {
+    if (raw && raw.trim().length > 0) return raw.trim();
+  }
+  return null;
+}
+
+function resolveGraphQLBase(): string {
+  return (
+    process.env.PNW_API_BASE_GRAPHQL ||
+    "https://api.politicsandwar.com/graphql"
+  ).trim();
+}
+
+function parseIdList(raw: string): number[] {
+  const nums = raw
+    .split(/[,\s]+/)
+    .map((s) => Number(s.trim()))
+    .filter((n) => Number.isFinite(n) && n > 0);
+  return Array.from(new Set(nums));
+}
 
 // ────────────────────────────────────────────────
 // Slash command definition
@@ -132,19 +129,38 @@ let nextPlanId = 1;
 export const builder = new SlashCommandBuilder()
   .setName("warplan")
   .setDescription("War planning helper using the Blitz spreadsheet format.")
-  // perms are managed via /command_roles, so no hard gate here
   .setDMPermission(false)
+  // /warplan seed_nations
   .addSubcommand((sub) =>
     sub
-      .setName("template")
-      .setDescription("Download a blank Blitz warplan sheet.")
+      .setName("seed_nations")
+      .setDescription(
+        "Seed a Blitz sheet from a list of enemy nation IDs (targets only, attackers blank).",
+      )
       .addStringOption((opt) =>
         opt
-          .setName("label")
-          .setDescription("Optional label for the sheet name / filename.")
-          .setRequired(false),
+          .setName("nation_ids")
+          .setDescription("Comma or space separated PnW Nation IDs (targets).")
+          .setRequired(true),
       ),
   )
+  // /warplan seed_alliance
+  .addSubcommand((sub) =>
+    sub
+      .setName("seed_alliance")
+      .setDescription(
+        "Seed a Blitz sheet from one or more alliance IDs (all current members as targets).",
+      )
+      .addStringOption((opt) =>
+        opt
+          .setName("alliance_ids")
+          .setDescription(
+            "Comma or space separated PnW Alliance IDs (e.g. 14509, 14000).",
+          )
+          .setRequired(true),
+      ),
+  )
+  // /warplan import
   .addSubcommand((sub) =>
     sub
       .setName("import")
@@ -188,6 +204,7 @@ export const builder = new SlashCommandBuilder()
           .setRequired(false),
       ),
   )
+  // /warplan apply_members
   .addSubcommand((sub) =>
     sub
       .setName("apply_members")
@@ -205,8 +222,13 @@ export const builder = new SlashCommandBuilder()
 export async function run(interaction: ChatInputCommandInteraction) {
   const sub = interaction.options.getSubcommand(true);
 
-  if (sub === "template") {
-    await handleTemplate(interaction);
+  if (sub === "seed_nations") {
+    await handleSeedNations(interaction);
+    return;
+  }
+
+  if (sub === "seed_alliance") {
+    await handleSeedAlliance(interaction);
     return;
   }
 
@@ -227,37 +249,13 @@ export async function run(interaction: ChatInputCommandInteraction) {
 }
 
 // ────────────────────────────────────────────────
-// /warplan template
+// Common sheet builder (header + NOTE row)
 // ────────────────────────────────────────────────
 
-async function handleTemplate(interaction: ChatInputCommandInteraction) {
-  await interaction.deferReply({ ephemeral: true });
-
-  const label = interaction.options.getString("label");
-  const workbookBuffer = await createTemplateWorkbook(label ?? undefined);
-
-  const filenameBase =
-    label && label.trim().length > 0 ? label.trim() : "Blitz Warplan";
-  const safeFilenameBase = filenameBase.replace(/[\\/:*?"<>|]+/g, "_");
-
-  const attachment = new AttachmentBuilder(workbookBuffer, {
-    name: `${safeFilenameBase}.xlsx`,
-  });
-
-  await interaction.editReply({
-    content:
-      "Here’s your Blitz warplan template.\n\n" +
-      "➡ **Required fields for each target row:**\n" +
-      "• **Nation** (can be rough; will be overwritten from PnW)\n" +
-      "• **NationID** (PnW Nation ID of the **target**)\n" +
-      "• **Attacker 1–3** (PnW Nation IDs of your fighters)\n\n" +
-      "All other columns will be auto-filled from the PnW API when you run `/warplan import`.",
-    files: [attachment],
-  });
-}
-
-async function createTemplateWorkbook(label?: string): Promise<Buffer> {
-  const workbook = new ExcelJS.Workbook();
+function initBlitzSheet(
+  workbook: ExcelJS.Workbook,
+  label?: string,
+): ExcelJS.Worksheet {
   const sheetName =
     label && label.trim().length > 0 ? label.trim() : "Blitz Warplan";
 
@@ -271,7 +269,7 @@ async function createTemplateWorkbook(label?: string): Promise<Buffer> {
   const noteText =
     "NOTE: Fill one row per TARGET nation. Required columns: Nation, NationID, Attacker 1–3. " +
     "Attacker fields must be **PnW Nation IDs** (not Discord IDs / names). " +
-    "All other fields will be auto-filled by the bot from PnW.";
+    "All other fields can be auto-filled by the bot from PnW.";
   const noteRow = sheet.addRow([noteText]);
   noteRow.getCell(1).font = { italic: true };
   sheet.mergeCells(2, 1, 2, BLITZ_HEADERS.length);
@@ -285,11 +283,279 @@ async function createTemplateWorkbook(label?: string): Promise<Buffer> {
     col.width = Math.max(12, String(header).length + 2);
   });
 
+  return sheet;
+}
+
+// ────────────────────────────────────────────────
+// /warplan seed_nations  (seed from explicit IDs)
+// ────────────────────────────────────────────────
+
+async function handleSeedNations(
+  interaction: ChatInputCommandInteraction,
+) {
+  const rawIds = interaction.options.getString("nation_ids", true);
+  await interaction.deferReply({ ephemeral: true });
+
+  const ids = parseIdList(rawIds);
+  if (!ids.length) {
+    await interaction.editReply(
+      "I couldn’t find any numeric Nation IDs in that input. " +
+        "Provide PnW Nation IDs like `731713 246232 429`.",
+    );
+    return;
+  }
+
+  const apiKey = resolvePnwKey();
+  if (!apiKey) {
+    await interaction.editReply(
+      "I can’t talk to the PnW API right now — no `PNW_API_KEY` / `PNW_DEFAULT_API_KEY` / `PNW_SERVICE_API_KEY` / `PNW_KEY` is set.",
+    );
+    return;
+  }
+
+  const statsList: EnrichedNationStats[] = [];
+  for (const id of ids) {
+    try {
+      const stats = await fetchNationStats(id, apiKey);
+      if (stats) statsList.push(stats);
+    } catch (err) {
+      console.error("[warplan seed_nations] failed for", id, err);
+    }
+  }
+
+  if (!statsList.length) {
+    await interaction.editReply(
+      "I couldn’t fetch any nation data for those IDs. Double-check they’re valid PnW Nation IDs.",
+    );
+    return;
+  }
+
+  // Sort by score desc to make the sheet nicer
+  statsList.sort((a, b) => (b.score ?? 0) - (a.score ?? 0));
+
+  const workbook = new ExcelJS.Workbook();
+  const sheet = initBlitzSheet(workbook, "Seeded Nations");
+
+  for (const stats of statsList) {
+    const row = sheet.addRow([]);
+    row.getCell(colIndex("Nation")).value = stats.name;
+    row.getCell(colIndex("NationID")).value = stats.id;
+    if (stats.allianceName !== null) {
+      row.getCell(colIndex("Alliance")).value = stats.allianceName;
+    }
+    if (stats.alliancePosition !== null) {
+      row.getCell(colIndex("Alliance Position")).value =
+        stats.alliancePosition;
+    }
+    if (stats.warPolicy !== null) {
+      row.getCell(colIndex("War Policy")).value = stats.warPolicy;
+    }
+    if (stats.color !== null) {
+      row.getCell(colIndex("Color")).value = stats.color;
+    }
+    if (stats.cities !== null) {
+      row.getCell(colIndex("Cities")).value = stats.cities;
+    }
+    if (stats.score !== null) {
+      row.getCell(colIndex("Score")).value = stats.score;
+      const minScore = Math.round(stats.score * 0.75 * 100) / 100;
+      const maxScore = Math.round(stats.score * 1.75 * 100) / 100;
+      row.getCell(colIndex("War Range")).value = `${minScore} - ${maxScore}`;
+    }
+    if (stats.beigeTurnsLeft !== null) {
+      row.getCell(colIndex("Beige Turns Left")).value =
+        stats.beigeTurnsLeft;
+    }
+    if (stats.offensiveWars !== null) {
+      row.getCell(colIndex("Offensive Wars")).value =
+        stats.offensiveWars;
+    }
+    if (stats.defensiveWars !== null) {
+      row.getCell(colIndex("Defensive Wars")).value =
+        stats.defensiveWars;
+    }
+    if (stats.soldiers !== null) {
+      row.getCell(colIndex("Soldiers")).value = stats.soldiers;
+    }
+    if (stats.tanks !== null) {
+      row.getCell(colIndex("Tanks")).value = stats.tanks;
+    }
+    if (stats.aircraft !== null) {
+      row.getCell(colIndex("Planes")).value = stats.aircraft;
+    }
+    if (stats.ships !== null) {
+      row.getCell(colIndex("Ships")).value = stats.ships;
+    }
+    if (stats.missiles !== null) {
+      row.getCell(colIndex("Missiles")).value = stats.missiles;
+    }
+    if (stats.nukes !== null) {
+      row.getCell(colIndex("Nukes")).value = stats.nukes;
+    }
+  }
+
   const xlsxData = await workbook.xlsx.writeBuffer();
   const nodeBuffer = Buffer.isBuffer(xlsxData)
     ? xlsxData
     : Buffer.from(xlsxData as ArrayBuffer);
-  return nodeBuffer;
+
+  const attachment = new AttachmentBuilder(nodeBuffer, {
+    name: "warplan-seeded-nations.xlsx",
+  });
+
+  await interaction.editReply({
+    content:
+      `Seeded **${statsList.length}** nation(s) into a Blitz-format sheet.\n\n` +
+      "➡ Fill in **Attacker 1–3** with your fighters’ **PnW Nation IDs**, " +
+      "then upload it back using `/warplan import` to enrich + (optionally) create war rooms.",
+    files: [attachment],
+  });
+}
+
+// ────────────────────────────────────────────────
+// /warplan seed_alliance  (seed from one or more alliances)
+// ────────────────────────────────────────────────
+
+async function handleSeedAlliance(
+  interaction: ChatInputCommandInteraction,
+) {
+  const raw = interaction.options.getString("alliance_ids", true);
+  await interaction.deferReply({ ephemeral: true });
+
+  const aids = parseIdList(raw);
+  if (!aids.length) {
+    await interaction.editReply(
+      "I couldn’t find any numeric Alliance IDs in that input. " +
+        "Provide PnW Alliance IDs like `14509 14000`.",
+    );
+    return;
+  }
+
+  const apiKey = resolvePnwKey();
+  if (!apiKey) {
+    await interaction.editReply(
+      "I can’t talk to the PnW API right now — no `PNW_API_KEY` / `PNW_DEFAULT_API_KEY` / `PNW_SERVICE_API_KEY` / `PNW_KEY` is set.",
+    );
+    return;
+  }
+
+  const allNationIds = new Set<number>();
+
+  for (const aid of aids) {
+    try {
+      const ids = await fetchAllianceNationIds(aid, apiKey);
+      ids.forEach((id) => allNationIds.add(id));
+    } catch (err) {
+      console.error("[warplan seed_alliance] failed for AID", aid, err);
+    }
+  }
+
+  if (!allNationIds.size) {
+    await interaction.editReply(
+      "I couldn’t find any nations for those alliance IDs.",
+    );
+    return;
+  }
+
+  const statsList: EnrichedNationStats[] = [];
+  for (const nid of allNationIds) {
+    try {
+      const stats = await fetchNationStats(nid, apiKey);
+      if (stats) statsList.push(stats);
+    } catch (err) {
+      console.error("[warplan seed_alliance] failed for NID", nid, err);
+    }
+  }
+
+  if (!statsList.length) {
+    await interaction.editReply(
+      "I couldn’t fetch any nation data for the alliances provided.",
+    );
+    return;
+  }
+
+  statsList.sort((a, b) => (b.score ?? 0) - (a.score ?? 0));
+
+  const workbook = new ExcelJS.Workbook();
+  const label = `Alliances ${aids.join(", ")}`;
+  const sheet = initBlitzSheet(workbook, label);
+
+  for (const stats of statsList) {
+    const row = sheet.addRow([]);
+    row.getCell(colIndex("Nation")).value = stats.name;
+    row.getCell(colIndex("NationID")).value = stats.id;
+    if (stats.allianceName !== null) {
+      row.getCell(colIndex("Alliance")).value = stats.allianceName;
+    }
+    if (stats.alliancePosition !== null) {
+      row.getCell(colIndex("Alliance Position")).value =
+        stats.alliancePosition;
+    }
+    if (stats.warPolicy !== null) {
+      row.getCell(colIndex("War Policy")).value = stats.warPolicy;
+    }
+    if (stats.color !== null) {
+      row.getCell(colIndex("Color")).value = stats.color;
+    }
+    if (stats.cities !== null) {
+      row.getCell(colIndex("Cities")).value = stats.cities;
+    }
+    if (stats.score !== null) {
+      row.getCell(colIndex("Score")).value = stats.score;
+      const minScore = Math.round(stats.score * 0.75 * 100) / 100;
+      const maxScore = Math.round(stats.score * 1.75 * 100) / 100;
+      row.getCell(colIndex("War Range")).value = `${minScore} - ${maxScore}`;
+    }
+    if (stats.beigeTurnsLeft !== null) {
+      row.getCell(colIndex("Beige Turns Left")).value =
+        stats.beigeTurnsLeft;
+    }
+    if (stats.offensiveWars !== null) {
+      row.getCell(colIndex("Offensive Wars")).value =
+        stats.offensiveWars;
+    }
+    if (stats.defensiveWars !== null) {
+      row.getCell(colIndex("Defensive Wars")).value =
+        stats.defensiveWars;
+    }
+    if (stats.soldiers !== null) {
+      row.getCell(colIndex("Soldiers")).value = stats.soldiers;
+    }
+    if (stats.tanks !== null) {
+      row.getCell(colIndex("Tanks")).value = stats.tanks;
+    }
+    if (stats.aircraft !== null) {
+      row.getCell(colIndex("Planes")).value = stats.aircraft;
+    }
+    if (stats.ships !== null) {
+      row.getCell(colIndex("Ships")).value = stats.ships;
+    }
+    if (stats.missiles !== null) {
+      row.getCell(colIndex("Missiles")).value = stats.missiles;
+    }
+    if (stats.nukes !== null) {
+      row.getCell(colIndex("Nukes")).value = stats.nukes;
+    }
+  }
+
+  const xlsxData = await workbook.xlsx.writeBuffer();
+  const nodeBuffer = Buffer.isBuffer(xlsxData)
+    ? xlsxData
+    : Buffer.from(xlsxData as ArrayBuffer);
+
+  const attachment = new AttachmentBuilder(nodeBuffer, {
+    name: "warplan-seeded-alliances.xlsx",
+  });
+
+  await interaction.editReply({
+    content:
+      `Seeded **${statsList.length}** nation(s) from alliance(s) **${aids.join(
+        ", ",
+      )}** into a Blitz-format sheet.\n\n` +
+      "➡ Fill in **Attacker 1–3** with your fighters’ **PnW Nation IDs**, " +
+      "then upload it back using `/warplan import` to enrich + (optionally) create war rooms.",
+    files: [attachment],
+  });
 }
 
 // ────────────────────────────────────────────────
@@ -377,24 +643,12 @@ async function handleImport(interaction: ChatInputCommandInteraction) {
   // Auto-enrich from PnW (stats, wars, etc.)
   // ────────────────────────────────────────────
   const statsById = new Map<number, EnrichedNationStats>();
-  const pnwKey =
-    process.env.PNW_API_KEY && process.env.PNW_API_KEY.trim().length > 0
-      ? process.env.PNW_API_KEY.trim()
-      : process.env.PNW_KEY && process.env.PNW_KEY.trim().length > 0
-        ? process.env.PNW_KEY.trim()
-        : process.env.PNW_DEFAULT_API_KEY &&
-            process.env.PNW_DEFAULT_API_KEY.trim().length > 0
-          ? process.env.PNW_DEFAULT_API_KEY.trim()
-          : process.env.PNW_SERVICE_API_KEY &&
-              process.env.PNW_SERVICE_API_KEY.trim().length > 0
-            ? process.env.PNW_SERVICE_API_KEY.trim()
-            : null;
+  const pnwKey = resolvePnwKey();
 
   if (autoEnrich && pnwKey) {
     const uniqueIds = Array.from(
       new Set(rowsWithNationId.map((r) => r.nationId!).filter(Boolean)),
     );
-
     for (const id of uniqueIds) {
       try {
         const stats = await fetchNationStats(id, pnwKey);
@@ -407,9 +661,6 @@ async function handleImport(interaction: ChatInputCommandInteraction) {
     }
 
     // Write stats back into the workbook columns
-    const colIndex = (header: BlitzHeader) =>
-      BLITZ_HEADERS.indexOf(header) + 1;
-
     for (const row of parsedRows) {
       if (!row.nationId) continue;
       const stats = statsById.get(row.nationId);
@@ -440,7 +691,8 @@ async function handleImport(interaction: ChatInputCommandInteraction) {
         // War range (rough) based on score
         const minScore = Math.round(stats.score * 0.75 * 100) / 100;
         const maxScore = Math.round(stats.score * 1.75 * 100) / 100;
-        excelRow.getCell(colIndex("War Range")).value = `${minScore} - ${maxScore}`;
+        excelRow.getCell(colIndex("War Range")).value =
+          `${minScore} - ${maxScore}`;
       }
       if (stats.beigeTurnsLeft !== null) {
         excelRow.getCell(colIndex("Beige Turns Left")).value =
@@ -472,15 +724,12 @@ async function handleImport(interaction: ChatInputCommandInteraction) {
       if (stats.nukes !== null) {
         excelRow.getCell(colIndex("Nukes")).value = stats.nukes;
       }
-      if (stats.spies !== null) {
-        // Not in headers currently; skip or add a custom column if needed.
-      }
 
       excelRow.commit();
     }
   } else if (autoEnrich && !pnwKey) {
     console.warn(
-      "[warplan] auto_enrich requested but no PNW key env set (checked PNW_API_KEY, PNW_KEY, PNW_DEFAULT_API_KEY, PNW_SERVICE_API_KEY).",
+      "[warplan] auto_enrich requested but no PNW_API_KEY / PNW_DEFAULT_API_KEY / PNW_SERVICE_API_KEY / PNW_KEY env set.",
     );
   }
 
@@ -536,7 +785,7 @@ async function handleImport(interaction: ChatInputCommandInteraction) {
       const nationId = row.nationId!;
       const stats = statsById.get(nationId);
       const nationName =
-        stats?.name || row.nation || `Target ${nationId}`;
+        stats?.name || row.nation || `Nation #${nationId}`;
       const slug = slugifyName(nationName);
       const baseName = `war-${slug}-${nationId}`;
       const channelName =
@@ -550,89 +799,42 @@ async function handleImport(interaction: ChatInputCommandInteraction) {
 
       createdChannels++;
 
+      const statLines: string[] = [];
+      if (stats) {
+        statLines.push(
+          `Score: **${stats.score ?? "?"}** | Cities: **${stats.cities ?? "?"}** | Color: **${stats.color ?? "?"}**`,
+        );
+        statLines.push(
+          `Soldiers: **${stats.soldiers ?? "?"}**, Tanks: **${stats.tanks ?? "?"}**, Planes: **${stats.aircraft ?? "?"}**, Ships: **${stats.ships ?? "?"}**`,
+        );
+        statLines.push(
+          `Missiles: **${stats.missiles ?? "?"}**, Nukes: **${stats.nukes ?? "?"}**, Spies: **${stats.spies ?? "?"}**`,
+        );
+        statLines.push(
+          `Off Wars: **${stats.offensiveWars ?? "?"}**, Def Wars: **${stats.defensiveWars ?? "?"}**, Beige Left: **${stats.beigeTurnsLeft ?? "?"}**`,
+        );
+      }
+
       const attackerNationIds = parseAttackerNationIds(row);
       const attackersLabel = attackerNationIds.length
         ? attackerNationIds.map((id) => `#${id}`).join(", ")
         : "—";
 
-      const dossier: DossierInfo | null = stats
-        ? {
-            score: stats.score ?? undefined,
-            cities: stats.cities ?? undefined,
-            soldiers: stats.soldiers ?? undefined,
-            tanks: stats.tanks ?? undefined,
-            aircraft: stats.aircraft ?? undefined,
-            ships: stats.ships ?? undefined,
-            missiles: stats.missiles ?? undefined,
-            nukes: stats.nukes ?? undefined,
-            beigeTurns: stats.beigeTurnsLeft ?? undefined,
-            allianceName: stats.allianceName ?? undefined,
-          }
-        : null;
+      let body =
+        `**War Room:** ${nationName} [${nationId}]\n` +
+        `Alliance: **${stats?.allianceName ?? row.alliance ?? "?"}**\n\n`;
 
-      let offense: WarRecord[] = [];
-      let defense: WarRecord[] = [];
-      try {
-        const wars = await fetchActiveWars(nationId);
-        offense = wars.offense;
-        defense = wars.defense;
-      } catch (err) {
-        console.error("[warplan] fetchActiveWars failed for", nationId, err);
+      if (statLines.length) {
+        body += statLines.join("\n") + "\n\n";
       }
 
-      const rowForEmbed: WarRoomRow = {
-        id: "0",
-        guild_id: guild.id,
-        channel_id: channel.id,
-        control_message_id: null,
-        name: nationName,
-        created_by_id: interaction.user.id,
-        target_nation_id: nationId,
-        target_nation_name: nationName,
-        notes: null,
-        member_ids: [interaction.user.id],
-        created_at: new Date(),
-      };
+      body += `**Assigned attackers (Nation IDs):** ${attackersLabel}\n`;
 
-      const embed = buildControlEmbed(
-        rowForEmbed,
-        interaction.user,
-        dossier,
-        offense,
-        defense,
-        attackersLabel,
-      );
-
-      const msg = await channel.send({
-        embeds: [embed],
-        components: [buildControlRow()],
-      });
-
+      const msg = await channel.send(body);
       try {
         await msg.pin();
       } catch {
         // ignore pin errors
-      }
-
-      // Insert DB record so /warroom buttons work
-      try {
-        await insertWarRoom({
-          guildId: rowForEmbed.guild_id,
-          channelId: rowForEmbed.channel_id,
-          controlMessageId: msg.id,
-          name: rowForEmbed.name,
-          createdById: rowForEmbed.created_by_id,
-          targetNationId: rowForEmbed.target_nation_id,
-          targetNationName: rowForEmbed.target_nation_name,
-          notes: rowForEmbed.notes,
-          memberIds: rowForEmbed.member_ids,
-        });
-      } catch (err) {
-        console.error(
-          "[warplan] Failed to insert war_rooms row for",
-          nationId,
-          err,
-        );
       }
 
       warTargets.push({
@@ -667,11 +869,14 @@ async function handleImport(interaction: ChatInputCommandInteraction) {
     : Buffer.from(xlsxData as ArrayBuffer);
 
   const originalName = attachment.name ?? "warplan.xlsx";
-  const base =
+  const baseName =
     originalName.toLowerCase().endsWith(".xlsx")
       ? originalName.slice(0, -5)
       : originalName;
-  const outName = `${base}-enriched.xlsx`.replace(/[\\/:*?"<>|]+/g, "_");
+  const outName = `${baseName}-enriched.xlsx`.replace(
+    /[\\/:*?"<>|]+/g,
+    "_",
+  );
 
   const outAttachment = new AttachmentBuilder(nodeBuffer, {
     name: outName,
@@ -690,7 +895,7 @@ async function handleImport(interaction: ChatInputCommandInteraction) {
     content += `• Auto-enriched from PnW for **${statsById.size}** nation(s).\n`;
   } else if (autoEnrich && !pnwKey) {
     content +=
-      "• Auto-enrich was requested, but no **PNW_API_KEY / PNW_KEY / PNW_DEFAULT_API_KEY / PNW_SERVICE_API_KEY** env was set. All non-required columns are left as-is.\n";
+      "• Auto-enrich was requested, but no **PNW_API_KEY / PNW_DEFAULT_API_KEY / PNW_SERVICE_API_KEY / PNW_KEY** env was set. All non-required columns are left as-is.\n";
   }
 
   if (createdChannels > 0) {
@@ -778,9 +983,9 @@ async function handleApplyMembers(
   let totalMembersAdded = 0;
 
   for (const target of plan.targets) {
-    const channel = (await guild.channels.fetch(
-      target.channelId,
-    ).catch(() => null)) as TextChannel | null;
+    const channel = (await guild.channels
+      .fetch(target.channelId)
+      .catch(() => null)) as TextChannel | null;
     if (!channel) continue;
 
     totalChannelsTouched++;
@@ -839,7 +1044,7 @@ async function handleApplyMembers(
 }
 
 // ────────────────────────────────────────────────
-// Helpers – Excel parsing
+// Helpers
 // ────────────────────────────────────────────────
 
 async function loadAndParseWarplanWorkbook(arrayBuffer: ArrayBuffer): Promise<{
@@ -984,251 +1189,170 @@ function parseAttackerNationIds(row: ParsedWarRow): number[] {
   return out;
 }
 
-// ────────────────────────────────────────────────
-// Helpers – PnW API + war room embed
-// ────────────────────────────────────────────────
-
 async function fetchNationStats(
   id: number,
   apiKey: string,
 ): Promise<EnrichedNationStats | null> {
-  const base =
-    (process.env.PNW_API_BASE_REST || "https://politicsandwar.com/api").trim();
-  const url = `${base.replace(/\/+$/, "")}/nation/id=${id}/&key=${encodeURIComponent(
-    apiKey,
-  )}`;
+  const base = resolveGraphQLBase();
+  const url = `${base}?api_key=${encodeURIComponent(apiKey)}`;
 
-  try {
-    const res = await fetch(url, { headers: { Accept: "application/json" } });
-    if (!res.ok) {
-      console.error("[warplan] REST /nation HTTP", res.status, "for", id);
-      return null;
-    }
-    const d: any = await res.json().catch(() => null);
-    if (!d || d.success === false) {
-      console.error("[warplan] REST /nation error payload for", id, d);
-      return null;
-    }
+  const queryBody = {
+    query: `
+      query ($id: ID!) {
+        nations(id: $id, first: 1) {
+          data {
+            id
+            nation_name
+            alliance_name
+            alliance_position
+            war_policy
+            color
+            cities
+            score
+            beige_turns_left
+            offensive_wars
+            defensive_wars
+            soldiers
+            tanks
+            aircraft
+            ships
+            missiles
+            nukes
+            spies
+          }
+        }
+      }
+    `,
+    variables: { id: String(id) },
+  };
 
-    const num = (v: any): number | null => {
-      if (v === null || v === undefined) return null;
-      const n = Number(v);
-      return Number.isFinite(n) ? n : null;
-    };
+  const res = await fetch(url, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(queryBody),
+  });
 
-    const allianceName =
-      typeof d.alliance === "string" && d.alliance !== "0" ? d.alliance : null;
-    const alliancePosition =
-      typeof d.alliance_position === "string" ? d.alliance_position : null;
-    const warPolicy =
-      typeof d.war_policy === "string" ? d.war_policy : null;
-    const color = typeof d.color === "string" ? d.color : null;
-
-    return {
-      id: num(d.nationid) ?? id,
-      name: String(d.nation_name ?? d.nation ?? `Nation ${id}`),
-      allianceName,
-      alliancePosition,
-      warPolicy,
-      color,
-      cities: num(d.cities),
-      score: num(d.score),
-      beigeTurnsLeft: num(d.beige_turns_left ?? d.beige_turns),
-      offensiveWars: null,
-      defensiveWars: null,
-      soldiers: num(d.soldiers),
-      tanks: num(d.tanks),
-      aircraft: num(d.aircraft),
-      ships: num(d.ships),
-      missiles: num(d.missiles),
-      nukes: num(d.nukes),
-      spies: num(d.spies),
-    };
-  } catch (err) {
-    console.error("[warplan] REST /nation exception for", id, err);
+  if (!res.ok) {
+    console.error(
+      "[warplan] GraphQL HTTP",
+      res.status,
+      "for nation",
+      id,
+    );
     return null;
   }
-}
 
-function ago(iso?: string | null): string {
-  if (!iso) return "";
-  const t = Date.parse(iso);
-  if (Number.isNaN(t)) return "";
-  const ms = Date.now() - t;
-  const d = Math.floor(ms / 86_400_000);
-  const h = Math.floor((ms % 86_400_000) / 3_600_000);
-  if (d > 0) return `${d}d ${h}h ago`;
-  const m = Math.floor((ms % 3_600_000) / 60_000);
-  if (h > 0) return `${h}h ${m}m ago`;
-  const s = Math.floor((ms % 60_000) / 1000);
-  return `${m}m ${s}s ago`;
-}
+  const json: any = await res.json().catch(() => null);
+  if (!json || json.errors) {
+    console.error("[warplan] GraphQL errors for nation", id, json?.errors);
+    return null;
+  }
 
-function formatWarsBlock(offense: WarRecord[], defense: WarRecord[]): string {
-  const slotLine = `🎯 **Slots:** O ${offense.length}/3 • D ${defense.length}/3`;
+  const node =
+    json.data?.nations?.data && json.data.nations.data[0]
+      ? json.data.nations.data[0]
+      : null;
+  if (!node) return null;
 
-  const fmtOff = (w: WarRecord) => {
-    const enemy = w.defender?.nation_name || `#${w.defender_id}`;
-    const started = ago(w.date);
-    const turns = (w as any).turns_left ?? "?";
-    return [
-      `• 💥 vs **${enemy}**`,
-      `   ⏱️ ${started} — ⏳ T${turns}`,
-      `   🔗 [Open War](https://politicsandwar.com/nation/war/status/war=${w.id}) • [Open Nation](https://politicsandwar.com/nation/id=${w.defender_id}) • [Declare](https://politicsandwar.com/nation/war/declare/id=${w.defender_id})`,
-    ].join("\n");
-  };
-  const fmtDef = (w: WarRecord) => {
-    const enemy = w.attacker?.nation_name || `#${w.attacker_id}`;
-    const started = ago(w.date);
-    const turns = (w as any).turns_left ?? "?";
-    return [
-      `• 🛡️ vs **${enemy}**`,
-      `   ⏱️ ${started} — ⏳ T${turns}`,
-      `   🔗 [Open War](https://politicsandwar.com/nation/war/status/war=${w.id}) • [Open Nation](https://politicsandwar.com/nation/id=${w.attacker_id}) • [Declare](https://politicsandwar.com/nation/war/declare/id=${w.attacker_id})`,
-    ].join("\n");
+  const toNum = (v: any): number | null => {
+    if (v === null || v === undefined) return null;
+    const n = Number(v);
+    return Number.isFinite(n) ? n : null;
   };
 
-  const oBlock = offense.length ? offense.map(fmtOff).join("\n\n") : "*None*";
-  const dBlock = defense.length ? defense.map(fmtDef).join("\n\n") : "*None*";
-
-  return [slotLine, "", `🗡️ **Offense**`, oBlock, "", `🛡️ **Defense**`, dBlock].join(
-    "\n",
-  );
+  return {
+    id: Number(node.id),
+    name: String(node.nation_name ?? `Nation ${id}`),
+    allianceName:
+      node.alliance_name !== undefined ? node.alliance_name : null,
+    alliancePosition:
+      node.alliance_position !== undefined
+        ? node.alliance_position
+        : null,
+    warPolicy:
+      node.war_policy !== undefined ? node.war_policy : null,
+    color: node.color !== undefined ? node.color : null,
+    cities: toNum(node.cities),
+    score: toNum(node.score),
+    beigeTurnsLeft: toNum(node.beige_turns_left),
+    offensiveWars: toNum(node.offensive_wars),
+    defensiveWars: toNum(node.defensive_wars),
+    soldiers: toNum(node.soldiers),
+    tanks: toNum(node.tanks),
+    aircraft: toNum(node.aircraft),
+    ships: toNum(node.ships),
+    missiles: toNum(node.missiles),
+    nukes: toNum(node.nukes),
+    spies: toNum(node.spies),
+  };
 }
 
-function formatDossierBlock(d: DossierInfo | null): string {
-  if (!d) return "No dossier data.";
-  const out: string[] = [];
-  if (d.allianceName) out.push(`🧑‍🤝‍🧑 **Alliance:** ${d.allianceName}`);
-  if (d.score !== undefined) out.push(`📈 **Score:** ${d.score.toFixed(2)}`);
-  if (d.cities !== undefined) out.push(`🏙️ **Cities:** ${d.cities}`);
+async function fetchAllianceNationIds(
+  aid: number,
+  apiKey: string,
+): Promise<number[]> {
+  const base = resolveGraphQLBase();
+  const url = `${base}?api_key=${encodeURIComponent(apiKey)}`;
 
-  const mil: string[] = [];
-  if (d.soldiers !== undefined) mil.push(`🪖 ${d.soldiers.toLocaleString()}`);
-  if (d.tanks !== undefined) mil.push(`🛡️ ${d.tanks.toLocaleString()}`);
-  if (d.aircraft !== undefined) mil.push(`✈️ ${d.aircraft.toLocaleString()}`);
-  if (d.ships !== undefined) mil.push(`🚢 ${d.ships.toLocaleString()}`);
-  if (mil.length) out.push(`⚔️ **Military:** ${mil.join(" • ")}`);
+  const body = {
+    query: `
+      query ($id: ID!) {
+        alliances(id: $id, first: 1) {
+          data {
+            id
+            name
+            nations(first: 500) {
+              data {
+                id
+              }
+            }
+          }
+        }
+      }
+    `,
+    variables: { id: String(aid) },
+  };
 
-  const boom: string[] = [];
-  if (d.missiles !== undefined) boom.push(`🎯 ${d.missiles}`);
-  if (d.nukes !== undefined) boom.push(`☢️ ${d.nukes}`);
-  if (boom.length) out.push(`💣 **Strategic:** ${boom.join(" • ")}`);
+  const res = await fetch(url, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
 
-  if (d.beigeTurns !== undefined) out.push(`🟫 **Beige:** ${d.beigeTurns} turns`);
+  if (!res.ok) {
+    console.error(
+      "[warplan] GraphQL HTTP",
+      res.status,
+      "for alliance",
+      aid,
+    );
+    return [];
+  }
 
-  return out.length ? out.join("\n") : "No dossier data.";
+  const json: any = await res.json().catch(() => null);
+  if (!json || json.errors) {
+    console.error(
+      "[warplan] GraphQL errors for alliance",
+      aid,
+      json?.errors,
+    );
+    return [];
+  }
+
+  const allianceNode =
+    json.data?.alliances?.data && json.data.alliances.data[0]
+      ? json.data.alliances.data[0]
+      : null;
+  if (!allianceNode) return [];
+
+  const nations = allianceNode.nations?.data ?? [];
+  const out: number[] = [];
+  for (const n of nations) {
+    const nid = Number(n.id);
+    if (Number.isFinite(nid) && nid > 0) out.push(nid);
+  }
+  return out;
 }
-
-function nationLink(id: number, name?: string | null) {
-  const safe = name && name.trim().length ? name.trim() : `Nation #${id}`;
-  return `[${safe}](https://politicsandwar.com/nation/id=${id})`;
-}
-
-function buildControlEmbed(
-  row: WarRoomRow,
-  creator: User,
-  dossier: DossierInfo | null,
-  offense: WarRecord[],
-  defense: WarRecord[],
-  attackersLabel: string,
-): EmbedBuilder {
-  const members =
-    row.member_ids.length > 0
-      ? row.member_ids.map((id) => `<@${id}>`).join("\n")
-      : "*none*";
-
-  const descParts: string[] = [
-    `🎯 **Target:** ${nationLink(row.target_nation_id, row.target_nation_name)}`,
-    `👤 **Created by:** <@${row.created_by_id}>`,
-    `⚔️ **Wars:** O ${offense.length} • D ${defense.length}`,
-    "",
-    `🗡️ **Assigned attackers (Nation IDs):**`,
-    attackersLabel || "—",
-    "",
-    "⚔️ **Active Wars** (Offense + Defense)",
-    formatWarsBlock(offense, defense),
-    "",
-    "📝 **Notes**",
-    row.notes?.trim() || "*none*",
-    "",
-    "👥 **Members**",
-    members,
-    "",
-    "📊 **Dossier**",
-    formatDossierBlock(dossier),
-  ];
-
-  return new EmbedBuilder()
-    .setColor(Colors.DarkRed)
-    .setTitle(`💥 WAR ROOM — ${row.target_nation_name}`)
-    .setDescription(descParts.join("\n"))
-    .setFooter({ text: "Gemstone Raider — War Room (via /warplan)" })
-    .setTimestamp(row.created_at ?? new Date());
-}
-
-function buildControlRow() {
-  return new ActionRowBuilder<ButtonBuilder>().addComponents(
-    new ButtonBuilder()
-      .setCustomId("warroom:addMember")
-      .setLabel("Add Member")
-      .setStyle(ButtonStyle.Primary),
-    new ButtonBuilder()
-      .setCustomId("warroom:removeMember")
-      .setLabel("Remove Member")
-      .setStyle(ButtonStyle.Secondary),
-    new ButtonBuilder()
-      .setCustomId("warroom:editNotes")
-      .setLabel("Edit Notes")
-      .setStyle(ButtonStyle.Secondary),
-    new ButtonBuilder()
-      .setCustomId("warroom:refreshDossier")
-      .setLabel("Refresh Dossier + Wars")
-      .setStyle(ButtonStyle.Success),
-    new ButtonBuilder()
-      .setCustomId("warroom:close")
-      .setLabel("Close War Room")
-      .setStyle(ButtonStyle.Danger),
-  );
-}
-
-async function insertWarRoom(row: {
-  guildId: string;
-  channelId: string;
-  controlMessageId: string;
-  name: string;
-  createdById: string;
-  targetNationId: number;
-  targetNationName: string;
-  notes: string | null;
-  memberIds: string[];
-}): Promise<WarRoomRow> {
-  const { rows } = await query<WarRoomRow>(
-    `
-    INSERT INTO war_rooms
-      (guild_id, channel_id, control_message_id, name, created_by_id,
-       target_nation_id, target_nation_name, notes, member_ids)
-    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
-    RETURNING *
-  `,
-    [
-      row.guildId,
-      row.channelId,
-      row.controlMessageId,
-      row.name,
-      row.createdById,
-      row.targetNationId,
-      row.targetNationName,
-      row.notes,
-      row.memberIds,
-    ],
-  );
-  return rows[0];
-}
-
-// ────────────────────────────────────────────────
-// Helpers – misc
-// ────────────────────────────────────────────────
 
 function slugifyName(name: string): string {
   return (
