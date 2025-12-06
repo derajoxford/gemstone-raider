@@ -161,9 +161,15 @@ async function fetchNationStats(id: number): Promise<EnrichedNationStats | null>
     const idNum =
       toNum(d.nationid ?? d.nation_id) ?? (Number.isFinite(id) ? id : 0);
 
+    // FIX: PnW REST uses `name` for the nation name.
+    const rawName =
+      (typeof d.name === "string" && d.name.trim().length
+        ? d.name
+        : d.nation ?? d.nation_name) ?? `Nation ${id}`;
+
     return {
       id: idNum,
-      name: String(d.nation ?? d.nation_name ?? `Nation ${id}`),
+      name: String(rawName),
       allianceName,
       alliancePosition: null, // REST doesn’t expose this cleanly; leave null
       warPolicy,
@@ -195,7 +201,7 @@ async function fetchAllianceNationIds(aid: number): Promise<number[]> {
   const url = `${base}?api_key=${encodeURIComponent(key)}`;
 
   const body = {
-    // Only fetch id to avoid field-name changes blowing us up
+    // Only fetch id to avoid field-name bullshit
     query: `{ nations(alliance_id:${aid}, first:500) { data { id } } }`,
   };
 
@@ -211,7 +217,11 @@ async function fetchAllianceNationIds(aid: number): Promise<number[]> {
     }
     const json: any = await res.json().catch(() => null);
     if (!json || json.errors) {
-      console.error("[warplan] GraphQL errors for alliance", aid, json?.errors);
+      console.error(
+        "[warplan] GraphQL errors for alliance",
+        aid,
+        json?.errors,
+      );
       return [];
     }
     const arr = json.data?.nations?.data ?? [];
@@ -567,10 +577,8 @@ async function handleImport(interaction: ChatInputCommandInteraction) {
 
       const excelRow = sheet.getRow(row.rowNumber);
 
-      // PnW nation name + ID always next to each other
       excelRow.getCell(colIndex("Nation")).value = stats.name;
       excelRow.getCell(colIndex("NationID")).value = stats.id;
-
       if (stats.allianceName !== null) {
         excelRow.getCell(colIndex("Alliance")).value = stats.allianceName;
       }
@@ -1111,7 +1119,6 @@ async function buildWorkbookFromStats(
   for (const stats of statsList) {
     const row = sheet.addRow([]);
 
-    // Nation name + ID always neighbors
     row.getCell(colIndex("Nation")).value = stats.name;
     row.getCell(colIndex("NationID")).value = stats.id;
 
